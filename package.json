@@ -1,0 +1,13 @@
+{
+  "name": "biblioteca-digital",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sistema multiusuario para biblioteca EPUB/PDF com leitura online e envio para Kindle.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

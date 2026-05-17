@@ -1,0 +1,6 @@
+data/
+storage/
+server.log
+server.err.log
+.gitconfig-codex
+git-meta/
