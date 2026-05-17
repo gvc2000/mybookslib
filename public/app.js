@@ -65,6 +65,28 @@ function progressRing(percent) {
   return `<span class="progress-ring" style="--progress:${angle}deg" title="${value}% lido"></span>`;
 }
 
+function bookDescription(book) {
+  return String(book.description || "").trim() || "Sinopse ainda nao encontrada para este livro.";
+}
+
+function bookMetadataRows(book) {
+  const rows = [
+    ["Publicacao", book.publishedDate],
+    ["Idioma", book.language],
+    ["Formato", book.format?.toUpperCase()],
+    ["Editora", book.publisher],
+    ["ISBN", book.isbn],
+    ["Paginas", book.pageCount],
+    ["Origem", book.metadataSource || book.coverSource]
+  ].filter(([, value]) => String(value || "").trim());
+  return rows.map(([label, value]) => `
+    <div class="preview-meta-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `).join("");
+}
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const app = $("#app");
 
@@ -398,11 +420,27 @@ function bookCard(book) {
   const checked = state.selectedBookIds.has(book.id) ? "checked" : "";
   const isFavorite = book.readingStatus === "favorite";
   const processing = book.status && book.status !== "ready";
+  const previewMeta = bookMetadataRows(book);
   return `
     <article class="book-card book-card-compact ${processing ? "is-processing" : ""}">
       <label class="book-select" title="Selecionar livro"><input type="checkbox" data-select-book="${book.id}" ${checked}></label>
       <button type="button" class="book-favorite ${isFavorite ? "active" : ""}" data-favorite="${book.id}" title="Favorito">${isFavorite ? "★" : "☆"}</button>
       <img class="cover ${processing ? "cover-skeleton" : ""}" src="${coverSrc(book)}" alt="Capa de ${escapeHtml(book.title || book.originalName)}">
+      <aside class="book-preview" aria-hidden="true">
+        <button type="button" class="preview-close" tabindex="-1">x</button>
+        <img class="preview-cover" src="${coverSrc(book)}" alt="">
+        <div class="preview-body">
+          <div class="preview-author">${escapeHtml(book.author || "Autor desconhecido")}</div>
+          <h3>${escapeHtml(book.title || book.originalName)}</h3>
+          <div class="preview-actions">
+            <button type="button" data-read="${book.id}" tabindex="-1">Ler</button>
+            <a class="button secondary" href="/files/${book.id}?download=1" download tabindex="-1">Download (${escapeHtml(formatFileSize(book.fileSize) || book.format.toUpperCase())})</a>
+          </div>
+          <div class="preview-section-title">Sinopse</div>
+          <p class="preview-description">${escapeHtml(bookDescription(book))}</p>
+          ${previewMeta ? `<div class="preview-meta">${previewMeta}</div>` : ""}
+        </div>
+      </aside>
       <div class="book-info">
         <div class="book-author">${escapeHtml(book.author || "Autor desconhecido")}</div>
         <div class="book-title">${escapeHtml(book.title || book.originalName)}</div>
@@ -418,6 +456,17 @@ function bookCard(book) {
       </div>
     </article>
   `;
+}
+
+function positionBookPreview(card, event) {
+  const preview = $(".book-preview", card);
+  if (!preview || window.matchMedia("(max-width: 820px)").matches) return;
+  const width = Math.min(560, window.innerWidth - 32);
+  const height = Math.min(520, window.innerHeight - 32);
+  const x = Math.min(event.clientX + 18, window.innerWidth - width - 16);
+  const y = Math.min(Math.max(16, event.clientY - 22), window.innerHeight - height - 16);
+  preview.style.setProperty("--preview-x", `${Math.max(16, x)}px`);
+  preview.style.setProperty("--preview-y", `${Math.max(16, y)}px`);
 }
 
 async function openBook(bookId) {
@@ -498,6 +547,10 @@ function renderSubjects() {
 }
 
 function bindBookActions() {
+  app.querySelectorAll(".book-card").forEach((card) => {
+    card.addEventListener("mouseenter", (event) => positionBookPreview(card, event));
+    card.addEventListener("mousemove", (event) => positionBookPreview(card, event));
+  });
   app.querySelectorAll("[data-select-book]").forEach((checkbox) => checkbox.onchange = () => {
     if (checkbox.checked) state.selectedBookIds.add(checkbox.dataset.selectBook);
     else state.selectedBookIds.delete(checkbox.dataset.selectBook);
@@ -624,7 +677,10 @@ function showBookModal(bookId) {
       <label>Editora <input name="publisher" value="${escapeHtml(book.publisher)}"></label>
       <label>ISBN <input name="isbn" value="${escapeHtml(book.isbn)}"></label>
       <label>Idioma <input name="language" value="${escapeHtml(book.language)}"></label>
+      <label>Publicacao <input name="publishedDate" value="${escapeHtml(book.publishedDate)}"></label>
+      <label>Paginas <input name="pageCount" inputmode="numeric" value="${escapeHtml(book.pageCount)}"></label>
       <label>Estante <input name="shelf" value="${escapeHtml(book.shelf)}"></label>
+      <label class="wide">Sinopse <textarea name="description" rows="5">${escapeHtml(book.description)}</textarea></label>
       <label class="wide">Assunto
         <select id="subjectPicker">
           <option value="">Selecione um assunto cadastrado</option>

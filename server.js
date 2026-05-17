@@ -288,6 +288,160 @@ async function fetchJson(url) {
   return JSON.parse(buffer.toString("utf8"));
 }
 
+function cleanOnlineText(value) {
+  return String(value || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function firstString(values) {
+  return (Array.isArray(values) ? values : [values]).map((item) => String(item || "").trim()).find(Boolean) || "";
+}
+
+function looksLikeFilenameTitle(book, value) {
+  const title = String(value || "").trim().toLowerCase();
+  const filename = path.parse(book.originalName || "").name.trim().toLowerCase();
+  return Boolean(title && filename && title === filename);
+}
+
+function shouldFillBookField(book, key) {
+  const value = book[key];
+  if (value === undefined || value === null || String(value).trim() === "") return true;
+  if (key === "author") return /^autor desconhecido$/i.test(String(value)) || /^unknown$/i.test(String(value));
+  if (key === "title") return looksLikeFilenameTitle(book, value);
+  return false;
+}
+
+function isbnFromIdentifiers(identifiers = []) {
+  const found = identifiers.find((item) => /isbn/i.test(item.type || "") && item.identifier);
+  return found ? String(found.identifier).replace(/[^\dXx]/g, "") : "";
+}
+
+function normalizeBookMetadata(raw) {
+  if (!raw) return null;
+  return {
+    title: firstString(raw.title),
+    author: firstString(raw.author),
+    publisher: firstString(raw.publisher),
+    isbn: firstString(raw.isbn).replace(/[^\dXx]/g, ""),
+    language: firstString(raw.language),
+    publishedDate: firstString(raw.publishedDate),
+    description: cleanOnlineText(raw.description),
+    pageCount: Number(raw.pageCount || 0) || "",
+    coverUrl: firstString(raw.coverUrl).replace(/^http:\/\//i, "https://"),
+    source: firstString(raw.source)
+  };
+}
+
+function applyOnlineMetadata(book, raw) {
+  const metadata = normalizeBookMetadata(raw);
+  if (!metadata) return false;
+  let changed = false;
+  for (const key of ["title", "author", "publisher", "isbn", "language", "publishedDate", "description", "pageCount"]) {
+    if (metadata[key] && shouldFillBookField(book, key)) {
+      book[key] = metadata[key];
+      changed = true;
+    }
+  }
+  if (changed && metadata.source) book.metadataSource = metadata.source;
+  return changed;
+}
+
+async function findGoogleBooksMetadata(book, candidates = coverSearchCandidates(book)) {
+  const searches = [];
+  if (book.isbn) searches.push(`isbn:${book.isbn}`);
+  for (const title of candidates) {
+    searches.push(hasKnownAuthor(book) ? `intitle:"${title}" inauthor:"${book.author}"` : `intitle:"${title}"`);
+    searches.push(hasKnownAuthor(book) ? `"${title}" "${book.author}"` : `"${title}"`);
+  }
+  for (const q of [...new Set(searches)].slice(0, 8)) {
+    const params = new URLSearchParams({ q, maxResults: "10", projection: "full" });
+    const data = await fetchJson(`https://www.googleapis.com/books/v1/volumes?${params}`);
+    const item = (data.items || []).find((entry) => {
+      const info = entry.volumeInfo || {};
+      return info.title && (info.description || info.publisher || info.industryIdentifiers?.length);
+    });
+    const info = item?.volumeInfo;
+    if (!info) continue;
+    const image = info.imageLinks?.extraLarge || info.imageLinks?.large || info.imageLinks?.medium || info.imageLinks?.thumbnail || info.imageLinks?.smallThumbnail;
+    return {
+      title: info.title,
+      author: info.authors,
+      publisher: info.publisher,
+      isbn: isbnFromIdentifiers(info.industryIdentifiers),
+      language: info.language,
+      publishedDate: info.publishedDate,
+      description: info.description,
+      pageCount: info.pageCount,
+      coverUrl: image,
+      source: "Google Books"
+    };
+  }
+  return null;
+}
+
+async function findOpenLibraryMetadata(book, candidates = coverSearchCandidates(book)) {
+  const searches = [];
+  if (book.isbn) searches.push(new URLSearchParams({ isbn: book.isbn, limit: "5" }));
+  for (const title of candidates) {
+    const params = new URLSearchParams({ title, limit: "5" });
+    if (hasKnownAuthor(book)) params.set("author", book.author);
+    searches.push(params);
+  }
+  for (const params of searches.slice(0, 8)) {
+    const data = await fetchJson(`https://openlibrary.org/search.json?${params}`);
+    const doc = (data.docs || []).find((item) => item.title);
+    if (!doc) continue;
+    let description = "";
+    if (doc.key) {
+      const work = await fetchJson(`https://openlibrary.org${doc.key}.json`).catch(() => null);
+      description = typeof work?.description === "string" ? work.description : work?.description?.value || "";
+    }
+    return {
+      title: doc.title,
+      author: doc.author_name,
+      publisher: doc.publisher,
+      isbn: doc.isbn,
+      language: doc.language,
+      publishedDate: doc.first_publish_year ? String(doc.first_publish_year) : "",
+      description,
+      pageCount: doc.number_of_pages_median,
+      coverUrl: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : "",
+      source: "Open Library"
+    };
+  }
+  return null;
+}
+
+async function enrichOnlineMetadata(book) {
+  const candidates = coverSearchCandidates(book);
+  const lookups = [
+    () => findGoogleBooksMetadata(book, candidates),
+    () => findOpenLibraryMetadata(book, candidates)
+  ];
+  for (const lookup of lookups) {
+    const metadata = await lookup().catch(() => null);
+    if (!metadata) continue;
+    const changed = applyOnlineMetadata(book, metadata);
+    if (!book.coverPath && !book.coverUrl && metadata.coverUrl) {
+      await downloadCover(book, metadata.coverUrl).catch(() => {
+        book.coverUrl = metadata.coverUrl;
+      });
+      if (book.coverPath || book.coverUrl) book.coverSource = metadata.source;
+    }
+    if (changed || book.coverPath || book.coverUrl) return metadata.source || "online";
+  }
+  return "";
+}
+
 function coverExt(contentType, url) {
   const lower = String(contentType || "").toLowerCase();
   if (lower.includes("png")) return ".png";
@@ -365,6 +519,7 @@ async function analyzeEpub(book, filePath) {
     .filter(Boolean)
     .map((item) => path.relative(outDir, path.join(opfDir, item.href)).replace(/\\/g, "/"));
   book.epub = { root: opfRel.replace(/\\/g, "/"), spine };
+  await enrichOnlineMetadata(book);
   await findOnlineCover(book);
   if (!book.coverPath && book.isbn) {
     await downloadCover(book, `https://covers.openlibrary.org/b/isbn/${book.isbn}-L.jpg`).catch(() => {
@@ -377,6 +532,7 @@ async function analyzeEpub(book, filePath) {
 async function analyzePdf(book) {
   book.title = book.title || path.parse(book.originalName).name;
   book.author = book.author || "Autor desconhecido";
+  await enrichOnlineMetadata(book);
   await findOnlineCover(book);
   if (!book.coverPath) await extractPdfFirstPageCover(book);
   if (!book.coverPath) book.coverSvg = makeCoverSvg(book, "#155e75", "#f8fafc");
@@ -752,6 +908,10 @@ async function createBookFromUpload(db, user, file, parts) {
     publisher: "",
     isbn: "",
     language: "",
+    publishedDate: "",
+    description: "",
+    pageCount: "",
+    metadataSource: "",
     format: ext.slice(1),
     originalName: path.basename(file.filename),
     relativeFolder: path.dirname(String(file.filename)).replace(/^[./\\]+$/, ""),
@@ -851,9 +1011,10 @@ function routeApi(req, res, pathname, user) {
       const book = db.books.find((item) => item.id === bookMatch[1] && canAccessBook(user, item));
       if (!book) return notFound(res);
       const body = JSON.parse((await readBody(req, 1024 * 100)).toString("utf8") || "{}");
-      ["title", "author", "publisher", "isbn", "language", "shelf"].forEach((key) => {
+      ["title", "author", "publisher", "isbn", "language", "publishedDate", "description", "shelf"].forEach((key) => {
         if (body[key] !== undefined) book[key] = String(body[key]);
       });
+      if (body.pageCount !== undefined) book.pageCount = Number(body.pageCount || 0) || "";
       if (Array.isArray(body.subjects)) {
         book.subjects = body.subjects.map(String).map(normalizeSubjectName).filter(Boolean);
         ensureSubjectsInCatalog(db, book.subjects);
