@@ -45,11 +45,18 @@ async function ensureDirs() {
     await saveDb({ users: [admin], books: [], annotations: [], subjects: [], shelves: [], sessions: [] });
   }
   const db = readDb();
+  let migrated = false;
   if (!Array.isArray(db.annotations)) {
     db.annotations = [];
-    await saveDb(db);
+    migrated = true;
   }
-  let migrated = false;
+  if (!Array.isArray(db.subjects)) {
+    db.subjects = [];
+    migrated = true;
+  }
+  const catalogBefore = (db.subjects || []).length;
+  ensureSubjectsInCatalog(db, (db.books || []).flatMap((book) => book.subjects || []));
+  if ((db.subjects || []).length !== catalogBefore) migrated = true;
   for (const book of db.books || []) {
     ["originalName", "relativeFolder"].forEach((key) => {
       if (book[key]) {
@@ -255,7 +262,7 @@ function requestBuffer(url, redirects = 0) {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
     const client = target.protocol === "https:" ? https : require("http");
-    const req = client.get(target, { headers: { "User-Agent": "MyBooks/0.1" }, timeout: 10000 }, (res) => {
+    const req = client.get(target, { headers: { "User-Agent": "MyBookLib/0.1" }, timeout: 10000 }, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirects < 3) {
         res.resume();
         const next = new URL(res.headers.location, target).toString();
@@ -558,7 +565,7 @@ function makeCoverSvg(bookOrTitle, bg = "#334155", fg = "#ffffff") {
   const renderedTitle = titleLines
     .map((line, index) => `<text x="48" y="${190 + index * 42}" font-family="Georgia,serif" font-size="34" font-weight="700" fill="${fg}">${esc(line).slice(0, 24)}</text>`)
     .join("");
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="420" height="620" viewBox="0 0 420 620"><rect width="420" height="620" fill="${bg}"/><rect x="28" y="28" width="364" height="564" fill="none" stroke="${fg}" stroke-opacity=".34" stroke-width="2"/><circle cx="330" cy="88" r="34" fill="${fg}" opacity=".12"/><text x="48" y="112" font-family="Arial,sans-serif" font-size="16" font-weight="700" fill="${fg}" opacity=".72">Meus Livros</text>${renderedTitle}<text x="48" y="454" font-family="Arial,sans-serif" font-size="19" fill="${fg}" opacity=".82">${esc(author).slice(0, 42)}</text><text x="48" y="540" font-family="Arial,sans-serif" font-size="16" font-weight="700" fill="${fg}" opacity=".72">${esc(format)}</text></svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="420" height="620" viewBox="0 0 420 620"><rect width="420" height="620" fill="${bg}"/><rect x="28" y="28" width="364" height="564" fill="none" stroke="${fg}" stroke-opacity=".34" stroke-width="2"/><circle cx="330" cy="88" r="34" fill="${fg}" opacity=".12"/><text x="48" y="112" font-family="Arial,sans-serif" font-size="16" font-weight="700" fill="${fg}" opacity=".72">MyBookLib</text>${renderedTitle}<text x="48" y="454" font-family="Arial,sans-serif" font-size="19" fill="${fg}" opacity=".82">${esc(author).slice(0, 42)}</text><text x="48" y="540" font-family="Arial,sans-serif" font-size="16" font-weight="700" fill="${fg}" opacity=".72">${esc(format)}</text></svg>`;
 }
 
 async function processBook(book, filePath) {
@@ -644,12 +651,90 @@ function findDuplicateBook(db, user, file, fingerprint) {
   ));
 }
 
+function duplicateGroupKey(book) {
+  if (book.fileHash) return `hash:${book.userId}:${book.fileHash}`;
+  return `legacy:${book.userId}:${book.format}:${normalizedBookName(book.originalName)}:${Number(book.fileSize || 0)}`;
+}
+
+function bookKeepScore(book) {
+  const progress = Number(book.readingProgress?.percent || 0);
+  const hasCover = book.coverPath || book.coverUrl ? 1 : 0;
+  const ready = book.status === "ready" ? 1 : 0;
+  const opened = book.lastOpenedAt ? 1 : 0;
+  return progress * 1000 + hasCover * 100 + ready * 10 + opened;
+}
+
+function normalizeSubjectName(value) {
+  return String(value || "").trim();
+}
+
+function ensureSubjectsInCatalog(db, names) {
+  if (!Array.isArray(db.subjects)) db.subjects = [];
+  for (const name of names || []) {
+    const subject = normalizeSubjectName(name);
+    if (!subject) continue;
+    if (!db.subjects.some((item) => item.toLowerCase() === subject.toLowerCase())) db.subjects.push(subject);
+  }
+  db.subjects.sort((a, b) => a.localeCompare(b, "pt-BR"));
+}
+
+async function removeBookFiles(book) {
+  await Promise.allSettled([
+    fsp.rm(book.filePath, { force: true }),
+    book.coverPath ? fsp.rm(book.coverPath, { force: true }) : null,
+    fsp.rm(path.join(EPUB_DIR, book.id), { recursive: true, force: true })
+  ]);
+}
+
+async function removeBookFromDb(db, book) {
+  const index = db.books.findIndex((item) => item.id === book.id);
+  if (index < 0) return false;
+  db.books.splice(index, 1);
+  db.annotations = (db.annotations || []).filter((item) => item.bookId !== book.id);
+  await removeBookFiles(book);
+  return true;
+}
+
+async function deduplicateLibrary(db, user, req) {
+  const books = booksForUser(db, user, req);
+  const groups = new Map();
+  for (const book of books) {
+    const key = duplicateGroupKey(book);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(book);
+  }
+  let removed = 0;
+  const duplicates = [];
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue;
+    group.sort((a, b) => {
+      const scoreDiff = bookKeepScore(b) - bookKeepScore(a);
+      if (scoreDiff !== 0) return scoreDiff;
+      return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    });
+    const kept = group[0];
+    for (const duplicate of group.slice(1)) {
+      if (await removeBookFromDb(db, duplicate)) {
+        removed += 1;
+        duplicates.push({
+          keptId: kept.id,
+          keptTitle: kept.title || kept.originalName,
+          removedId: duplicate.id,
+          removedTitle: duplicate.title || duplicate.originalName
+        });
+      }
+    }
+  }
+  if (removed) await saveDb(db);
+  return { removed, duplicates };
+}
+
 async function createBookFromUpload(db, user, file, parts) {
   const ext = path.extname(file.filename).toLowerCase();
   if (![".epub", ".pdf"].includes(ext)) return { error: `${path.basename(file.filename)} ignorado: apenas EPUB e PDF sao aceitos` };
   const fingerprint = fileFingerprint(file);
   const duplicate = findDuplicateBook(db, user, file, fingerprint);
-  if (duplicate) return { error: `${path.basename(file.filename)} ignorado: ja existe em Meus Livros` };
+  if (duplicate) return { error: `${path.basename(file.filename)} ignorado: ja existe no MyBookLib` };
   const storageLimit = Number(user.storageLimitMb || 0) * 1024 * 1024;
   if (storageLimit && userStorageBytes(db, user.id) + file.data.length > storageLimit) {
     return { error: `${path.basename(file.filename)} ignorado: limite de armazenamento excedido` };
@@ -678,12 +763,13 @@ async function createBookFromUpload(db, user, file, parts) {
     coverSvg: "",
     subjects: cleanListPart(parts.subjects),
     tags: cleanListPart(parts.tags),
-    shelf: cleanTextPart(parts.shelf) || "Meus Livros",
+    shelf: cleanTextPart(parts.shelf) || "MyBookLib",
     readingProgress: { position: 0, label: "", percent: 0 },
     status: "uploaded",
     createdAt: now,
     updatedAt: now
   };
+  ensureSubjectsInCatalog(db, book.subjects);
   db.books.push(book);
   await saveDb(db);
   processBook(book, filePath);
@@ -712,8 +798,32 @@ function routeApi(req, res, pathname, user) {
     if (!user) return json(res, 401, { error: "Login necessario" });
     const db = readDb();
 
+    if (pathname === "/api/subjects" && req.method === "GET") {
+      return json(res, 200, { subjects: db.subjects || [] });
+    }
+    if (pathname === "/api/subjects" && req.method === "POST") {
+      const body = JSON.parse((await readBody(req, 1024 * 20)).toString("utf8") || "{}");
+      const subject = normalizeSubjectName(body.name);
+      if (!subject) return json(res, 400, { error: "Informe o nome do assunto" });
+      ensureSubjectsInCatalog(db, [subject]);
+      await saveDb(db);
+      return json(res, 201, { subjects: db.subjects });
+    }
+    const subjectMatch = pathname.match(/^\/api\/subjects\/([^/]+)$/);
+    if (subjectMatch && req.method === "DELETE") {
+      const subjectName = decodeURIComponent(subjectMatch[1]);
+      const before = db.subjects.length;
+      db.subjects = (db.subjects || []).filter((item) => item.toLowerCase() !== subjectName.toLowerCase());
+      if (db.subjects.length === before) return notFound(res);
+      await saveDb(db);
+      return json(res, 200, { subjects: db.subjects });
+    }
     if (pathname === "/api/books" && req.method === "GET") {
       return json(res, 200, { books: booksForUser(db, user, req).map((book) => publicBook(db, book)) });
+    }
+    if (pathname === "/api/books/deduplicate" && req.method === "POST") {
+      const result = await deduplicateLibrary(db, user, req);
+      return json(res, 200, result);
     }
     if (pathname === "/api/books" && req.method === "POST") {
       const parts = parseMultipart(await readBody(req), req.headers["content-type"]);
@@ -727,6 +837,15 @@ function routeApi(req, res, pathname, user) {
       const errors = results.map((result) => result.error).filter(Boolean);
       return json(res, books.length ? 201 : 400, { book: books[0], books, errors });
     }
+    const bookOpenMatch = pathname.match(/^\/api\/books\/([^/]+)\/open$/);
+    if (bookOpenMatch && req.method === "POST") {
+      const book = db.books.find((item) => item.id === bookOpenMatch[1] && canAccessBook(user, item));
+      if (!book) return notFound(res);
+      book.lastOpenedAt = new Date().toISOString();
+      book.updatedAt = book.lastOpenedAt;
+      await saveDb(db);
+      return json(res, 200, { book: publicBook(db, book) });
+    }
     const bookMatch = pathname.match(/^\/api\/books\/([^/]+)$/);
     if (bookMatch && req.method === "PATCH") {
       const book = db.books.find((item) => item.id === bookMatch[1] && canAccessBook(user, item));
@@ -735,23 +854,29 @@ function routeApi(req, res, pathname, user) {
       ["title", "author", "publisher", "isbn", "language", "shelf"].forEach((key) => {
         if (body[key] !== undefined) book[key] = String(body[key]);
       });
-      if (Array.isArray(body.subjects)) book.subjects = body.subjects.map(String);
+      if (Array.isArray(body.subjects)) {
+        book.subjects = body.subjects.map(String).map(normalizeSubjectName).filter(Boolean);
+        ensureSubjectsInCatalog(db, book.subjects);
+      }
       if (Array.isArray(body.tags)) book.tags = body.tags.map(String);
-      if (body.readingProgress) book.readingProgress = body.readingProgress;
+      if (body.readingStatus !== undefined) {
+        const allowed = new Set(["", "favorite", "planned", "completed"]);
+        book.readingStatus = allowed.has(body.readingStatus) ? body.readingStatus : "";
+      }
+      if (body.readingProgress) {
+        book.readingProgress = body.readingProgress;
+        if (Number(book.readingProgress?.percent || 0) >= 100 && book.readingStatus !== "planned") {
+          book.readingStatus = "completed";
+        }
+      }
       book.updatedAt = new Date().toISOString();
       await saveDb(db);
       return json(res, 200, { book });
     }
     if (bookMatch && req.method === "DELETE") {
-      const index = db.books.findIndex((item) => item.id === bookMatch[1] && canAccessBook(user, item));
-      if (index < 0) return notFound(res);
-      const [book] = db.books.splice(index, 1);
+      const book = db.books.find((item) => item.id === bookMatch[1] && canAccessBook(user, item));
+      if (!book || !(await removeBookFromDb(db, book))) return notFound(res);
       await saveDb(db);
-      await Promise.allSettled([
-        fsp.rm(book.filePath, { force: true }),
-        book.coverPath ? fsp.rm(book.coverPath, { force: true }) : null,
-        fsp.rm(path.join(EPUB_DIR, book.id), { recursive: true, force: true })
-      ]);
       return json(res, 200, { ok: true });
     }
     const kindleMatch = pathname.match(/^\/api\/books\/([^/]+)\/kindle$/);
@@ -945,7 +1070,7 @@ async function main() {
     return servePublic(req, res, url.pathname);
   });
   server.listen(PORT, () => {
-    console.log(`Meus Livros em http://localhost:${PORT}`);
+    console.log(`MyBookLib em http://localhost:${PORT}`);
     console.log("Login inicial: admin@local / admin123");
   });
 }

@@ -2,14 +2,68 @@ const state = {
   user: null,
   books: [],
   users: [],
+  subjects: [],
   view: "library",
   selectedBook: null,
   selectedBookIds: new Set(),
   chapter: 0,
   annotations: [],
   libraryScope: "mine",
-  filters: { q: "", subject: "", format: "" }
+  filters: { q: "", subject: "", format: "", shelfTab: "all" },
+  theme: localStorage.getItem("mybooklib-theme") || "light"
 };
+
+function applyTheme(theme) {
+  state.theme = theme === "dark" ? "dark" : "light";
+  document.body.classList.toggle("theme-dark", state.theme === "dark");
+  localStorage.setItem("mybooklib-theme", state.theme);
+}
+
+function bookMatchesShelfTab(book, tab) {
+  const status = book.readingStatus || "";
+  const percent = Number(book.readingProgress?.percent || 0);
+  if (tab === "all") return true;
+  if (tab === "favorite") return status === "favorite";
+  if (tab === "planned") return status === "planned";
+  if (tab === "completed") return status === "completed" || percent >= 100;
+  return true;
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes || 0);
+  if (!size) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size < 10 * 1024 ? 1 : 0)} KB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+function coverSrc(book) {
+  const base = book.coverUrl || `/covers/${book.id}`;
+  const stamp = book.updatedAt || book.lastOpenedAt || "";
+  return stamp ? `${base}?v=${encodeURIComponent(stamp)}` : base;
+}
+
+function readingMeta(book) {
+  const size = formatFileSize(book.fileSize);
+  if (book.status !== "ready") return `${book.format.toUpperCase()} · ${escapeHtml(book.status)}`;
+  const percent = Math.round(book.readingProgress?.percent || 0);
+  const sizePart = size ? `<span class="book-size">${size}</span>` : "";
+  return `${book.format.toUpperCase()} · ${sizePart}<span class="book-progress">${percent}% lido</span>`;
+}
+
+function recentBooks(limit = 12) {
+  return [...state.books]
+    .filter((book) => book.lastOpenedAt)
+    .sort((a, b) => new Date(b.lastOpenedAt) - new Date(a.lastOpenedAt))
+    .slice(0, limit);
+}
+
+function progressRing(percent) {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0));
+  const angle = (value / 100) * 360;
+  return `<span class="progress-ring" style="--progress:${angle}deg" title="${value}% lido"></span>`;
+}
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const app = $("#app");
@@ -44,18 +98,24 @@ function icon(name) {
 }
 
 async function boot() {
+  applyTheme(state.theme);
   const { user } = await api("/api/me");
   state.user = user;
   if (!user) return renderLogin();
-  await loadBooks();
+  await Promise.all([loadBooks(), loadSubjects()]);
   renderShell();
+}
+
+async function loadSubjects() {
+  const data = await api("/api/subjects");
+  state.subjects = data.subjects || [];
 }
 
 function renderLogin() {
   app.innerHTML = `
     <section class="login">
       <form class="login-card" id="loginForm">
-        <div class="brand"><span class="brand-mark">${icon("book")}</span><span>Meus Livros</span></div>
+        <div class="brand"><span class="brand-mark">${icon("book")}</span><span>MyBookLib</span></div>
         <h1>Entrar</h1>
         <p class="muted">Acesso inicial: admin@local / admin123</p>
         <label>E-mail <input name="email" type="email" autocomplete="email" required value="admin@local"></label>
@@ -100,23 +160,25 @@ function renderShell() {
   app.innerHTML = `
     <section class="shell">
       <header class="app-header">
-        <div class="brand"><span class="brand-mark">${icon("book")}</span><span>Meus Livros</span></div>
+        <div class="brand"><span class="brand-mark">${icon("book")}</span><span>MyBookLib</span></div>
         <nav class="top-nav">
           <button class="${state.view === "library" ? "active" : ""}" data-view="library">${icon("book")} Estante</button>
           <button class="${state.view === "upload" ? "active" : ""}" data-view="upload">${icon("upload")} Enviar livro</button>
           ${state.user.role === "admin" ? `<button class="${state.view === "admin" ? "active" : ""}" data-view="admin">${icon("users")} Administracao</button>` : ""}
         </nav>
         <div class="header-actions">
+          <button class="secondary icon" id="themeToggle" title="Alternar tema">${state.theme === "dark" ? "☀" : "☾"}</button>
           <button class="secondary icon" title="Notificacoes">${icon("bell")}</button>
           <div class="avatar" title="${escapeHtml(state.user.name)}">${escapeHtml(initials(state.user.name))}</div>
-          <button id="headerUpload">${icon("upload")} Upload</button>
+          ${state.view !== "upload" ? `<button id="headerUpload">${icon("upload")} Upload</button>` : ""}
         </div>
       </header>
       <div class="main-layout">
         <aside class="sidebar">
           <nav class="nav">
-            <button class="active">Todo conteudo <span>${state.books.length}</span></button>
+            <button class="${state.view === "library" ? "active" : ""}" data-view="library">Todo conteudo <span>${state.books.length}</span></button>
             <button data-view="upload">Envio Kindle</button>
+            <button class="${state.view === "subjects" ? "active" : ""}" data-view="subjects">Assuntos <span>${state.subjects.length}</span></button>
           </nav>
           <div class="user-box">
             <strong>${escapeHtml(state.user.name)}</strong>
@@ -131,6 +193,7 @@ function renderShell() {
   app.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", async () => {
     state.view = button.dataset.view;
     if (state.view === "admin") await loadUsers();
+    if (state.view === "subjects") await loadSubjects();
     renderShell();
   }));
   $("#logout")?.addEventListener("click", async () => {
@@ -142,67 +205,170 @@ function renderShell() {
     state.view = "upload";
     renderShell();
   });
+  $("#themeToggle")?.addEventListener("click", () => {
+    applyTheme(state.theme === "dark" ? "light" : "dark");
+    renderShell();
+  });
   renderScreen();
 }
 
 function renderScreen() {
   if (state.view === "upload") return renderUpload();
   if (state.view === "admin") return renderAdmin();
+  if (state.view === "subjects") return renderSubjects();
   renderLibrary();
 }
 
-function uniqueValues(key) {
-  const set = new Set();
-  state.books.forEach((book) => (book[key] || []).forEach?.((item) => set.add(item)));
-  return [...set].sort((a, b) => a.localeCompare(b));
+function normalizeSubjectLabel(value) {
+  return String(value || "").trim();
+}
+
+function subjectKey(value) {
+  return normalizeSubjectLabel(value).toLocaleLowerCase("pt-BR");
+}
+
+function catalogSubjects() {
+  const merged = new Map();
+  state.books.forEach((book) => {
+    (book.subjects || []).forEach((item) => {
+      const label = normalizeSubjectLabel(item);
+      if (label) merged.set(subjectKey(label), label);
+    });
+  });
+  (state.subjects || []).forEach((item) => {
+    const label = normalizeSubjectLabel(item);
+    if (label && !merged.has(subjectKey(label))) merged.set(subjectKey(label), label);
+  });
+  return [...merged.values()].sort((a, b) => a.localeCompare(b, "pt-BR"));
+}
+
+function bookMatchesSubject(book, filterSubject) {
+  const needle = subjectKey(filterSubject);
+  if (!needle) return true;
+  return (book.subjects || []).some((item) => subjectKey(item) === needle);
 }
 
 function filteredBooks() {
-  const q = state.filters.q.toLowerCase();
+  const q = state.filters.q.toLowerCase().trim();
   return state.books.filter((book) => {
     const haystack = [book.title, book.author, book.publisher, book.shelf, ...(book.subjects || []), ...(book.tags || [])].join(" ").toLowerCase();
     return (!q || haystack.includes(q)) &&
-      (!state.filters.subject || (book.subjects || []).includes(state.filters.subject)) &&
-      (!state.filters.format || book.format === state.filters.format);
+      bookMatchesSubject(book, state.filters.subject) &&
+      (!state.filters.format || book.format === state.filters.format) &&
+      bookMatchesShelfTab(book, state.filters.shelfTab);
   });
 }
 
+function shelfTabsMarkup() {
+  const tabs = [
+    { id: "all", label: "Todos" },
+    { id: "favorite", label: "Favoritos" },
+    { id: "planned", label: "Planejados" },
+    { id: "completed", label: "Concluidos" }
+  ];
+  return `<div class="shelf-tabs">${tabs.map((tab) => `
+    <button type="button" class="${state.filters.shelfTab === tab.id ? "active" : ""}" data-shelf-tab="${tab.id}">${tab.label}</button>
+  `).join("")}</div>`;
+}
+
+function renderRecentlyOpened() {
+  const recent = recentBooks();
+  if (!recent.length) return "";
+  return `
+    <section class="recent-section">
+      <div class="section-head">
+        <h2>Abertos recentemente</h2>
+        <span class="muted">${recent.length}</span>
+      </div>
+      <div class="recent-track">${recent.map(recentBookCard).join("")}</div>
+    </section>
+  `;
+}
+
+function recentBookCard(book) {
+  const percent = Math.round(book.readingProgress?.percent || 0);
+  return `
+    <article class="recent-card">
+      <img class="recent-cover" src="${coverSrc(book)}" alt="">
+      <div class="recent-body">
+        <div class="recent-author">${escapeHtml(book.author || "Autor desconhecido")}</div>
+        <div class="recent-title">${escapeHtml(book.title || book.originalName)}</div>
+        <div class="recent-footer">
+          <span class="recent-meta">${formatFileSize(book.fileSize)}</span>
+          <button class="recent-continue" data-read="${book.id}">
+            ${progressRing(percent)}
+            <span>Continuar</span>
+          </button>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function decodeFilterValue(value) {
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function renderLibrary() {
-  const subjects = uniqueValues("subjects");
+  const subjects = catalogSubjects();
   const books = filteredBooks();
+  const recent = recentBooks();
   $("#screen").innerHTML = `
-    <header class="topbar">
+    <header class="topbar topbar-compact">
       <div>
-        <h1>${state.libraryScope === "all" ? "Meus Livros - acervo completo" : "Meus Livros"}</h1>
+        <h1>${state.libraryScope === "all" ? "Acervo completo" : "Minha estante"}</h1>
+        <div class="muted">${state.books.length} livro(s) · ${books.length} visiveis</div>
       </div>
       <div class="topbar-actions">
-        <button class="danger" id="deleteSelected" ${state.selectedBookIds.size ? "" : "disabled"}>${icon("trash")} Excluir selecionados</button>
-        <button id="goUpload">${icon("upload")} Upload</button>
+        <button class="secondary subtle" id="dedupeBooks" title="Remover duplicados">${icon("book")}</button>
+        <button class="danger subtle" id="deleteSelected" title="Excluir selecionados" ${state.selectedBookIds.size ? "" : "disabled"}>${icon("trash")}</button>
       </div>
     </header>
-    <div class="toolbar">
+    ${renderRecentlyOpened()}
+    <div class="library-panel">
+      <div class="shelf-bar">
+        <h2 class="shelf-heading">Minha estante</h2>
+        ${shelfTabsMarkup()}
+      </div>
+      <div class="filter-bar toolbar">
       <label class="select-all"><input type="checkbox" id="selectAllBooks" ${books.length && books.every((book) => state.selectedBookIds.has(book.id)) ? "checked" : ""}> Todos</label>
       ${state.user.role === "admin" ? `
-        <select id="scopeFilter" title="Escopo da biblioteca">
+        <select id="scopeFilter" class="filter-select" title="Escopo">
           <option value="mine" ${state.libraryScope === "mine" ? "selected" : ""}>Meus livros</option>
           <option value="all" ${state.libraryScope === "all" ? "selected" : ""}>Todos</option>
-        </select>` : `<div class="tabs"><button class="active">Todos</button></div>`}
-      <select id="subjectFilter">
+        </select>` : ""}
+      <select id="subjectFilter" class="filter-select">
         <option value="">Assunto</option>
-        ${subjects.map((subject) => `<option ${subject === state.filters.subject ? "selected" : ""}>${escapeHtml(subject)}</option>`).join("")}
+        ${subjects.map((subject) => {
+          const selected = subjectKey(subject) === subjectKey(state.filters.subject);
+          return `<option value="${encodeURIComponent(subject)}" ${selected ? "selected" : ""}>${escapeHtml(subject)}</option>`;
+        }).join("")}
       </select>
       <div class="search-wrap">${icon("book")} <input id="search" placeholder="Buscar livro..." value="${escapeHtml(state.filters.q)}"></div>
-      <div class="view-icons">${icon("book")} ${icon("users")}</div>
-      <select id="formatFilter">
+      <select id="formatFilter" class="filter-select">
         <option value="">Formato</option>
         <option value="epub" ${state.filters.format === "epub" ? "selected" : ""}>EPUB</option>
         <option value="pdf" ${state.filters.format === "pdf" ? "selected" : ""}>PDF</option>
       </select>
       <button class="secondary icon" id="clearFilters" title="Limpar filtros">x</button>
     </div>
-    ${books.length ? `<section class="card-grid">${books.map(bookCard).join("")}</section>` : `<div class="empty">Sua estante ainda esta vazia ou nenhum livro combina com os filtros.</div>`}
+    <div class="content-head">
+      <h3>Todo o conteudo <span class="muted">${books.length}</span></h3>
+      ${normalizeSubjectLabel(state.filters.subject) ? `<span class="filter-pill">Assunto: ${escapeHtml(normalizeSubjectLabel(state.filters.subject))}</span>` : ""}
+    </div>
+    ${books.length ? `<section class="card-grid card-grid-compact">${books.map(bookCard).join("")}</section>` : `<div class="empty compact">Nenhum livro encontrado com os filtros atuais.</div>`}
+    </div>
   `;
-  $("#goUpload").onclick = () => { state.view = "upload"; renderShell(); };
+  $("#dedupeBooks").onclick = deduplicateBooks;
+  app.querySelectorAll("[data-shelf-tab]").forEach((button) => button.onclick = () => {
+    state.filters.shelfTab = button.dataset.shelfTab;
+    renderLibrary();
+  });
   $("#deleteSelected").onclick = deleteSelectedBooks;
   $("#selectAllBooks")?.addEventListener("change", (event) => {
     if (event.target.checked) books.forEach((book) => state.selectedBookIds.add(book.id));
@@ -215,25 +381,33 @@ function renderLibrary() {
     renderLibrary();
   });
   $("#search").oninput = (event) => { state.filters.q = event.target.value; renderLibrary(); };
-  $("#subjectFilter").onchange = (event) => { state.filters.subject = event.target.value; renderLibrary(); };
+  $("#subjectFilter").onchange = (event) => {
+    state.filters.subject = normalizeSubjectLabel(decodeFilterValue(event.target.value));
+    renderLibrary();
+  };
   $("#formatFilter").onchange = (event) => { state.filters.format = event.target.value; renderLibrary(); };
-  $("#clearFilters").onclick = () => { state.filters = { q: "", subject: "", format: "" }; renderLibrary(); };
+  $("#clearFilters").onclick = () => {
+    state.filters = { q: "", subject: "", format: "", shelfTab: state.filters.shelfTab };
+    renderLibrary();
+  };
   bindBookActions();
 }
 
 function bookCard(book) {
   const owner = state.libraryScope === "all" && book.ownerName ? `<div class="book-owner">${escapeHtml(book.ownerName)}</div>` : "";
   const checked = state.selectedBookIds.has(book.id) ? "checked" : "";
+  const isFavorite = book.readingStatus === "favorite";
+  const processing = book.status && book.status !== "ready";
   return `
-    <article class="book-card">
+    <article class="book-card book-card-compact ${processing ? "is-processing" : ""}">
       <label class="book-select" title="Selecionar livro"><input type="checkbox" data-select-book="${book.id}" ${checked}></label>
-      <img class="cover" src="${book.coverUrl || `/covers/${book.id}`}" alt="Capa de ${escapeHtml(book.title || book.originalName)}">
+      <button type="button" class="book-favorite ${isFavorite ? "active" : ""}" data-favorite="${book.id}" title="Favorito">${isFavorite ? "★" : "☆"}</button>
+      <img class="cover ${processing ? "cover-skeleton" : ""}" src="${coverSrc(book)}" alt="Capa de ${escapeHtml(book.title || book.originalName)}">
       <div class="book-info">
-        <div class="book-title">${escapeHtml(book.title || book.originalName)}</div>
         <div class="book-author">${escapeHtml(book.author || "Autor desconhecido")}</div>
+        <div class="book-title">${escapeHtml(book.title || book.originalName)}</div>
         ${owner}
-        <div class="chips">${(book.subjects || []).slice(0, 3).map((subject) => `<span class="chip">${escapeHtml(subject)}</span>`).join("")}</div>
-        <div class="book-meta">${book.format.toUpperCase()} - ${book.status === "ready" ? `${Math.round(book.readingProgress?.percent || 0)}% lido` : escapeHtml(book.status)}</div>
+        <div class="book-meta">${readingMeta(book)}</div>
         <div class="actions">
           <button data-read="${book.id}">Ler</button>
           <a class="button secondary icon" title="Download" href="/files/${book.id}?download=1" download>${icon("download")}</a>
@@ -246,32 +420,109 @@ function bookCard(book) {
   `;
 }
 
+async function openBook(bookId) {
+  const book = state.books.find((item) => item.id === bookId);
+  if (!book) return;
+  try {
+    const data = await api(`/api/books/${bookId}/open`, { method: "POST" });
+    book.lastOpenedAt = data.book?.lastOpenedAt || new Date().toISOString();
+  } catch {
+    book.lastOpenedAt = new Date().toISOString();
+  }
+  state.selectedBook = book;
+  state.chapter = Number(book.readingProgress?.position || 0);
+  await loadAnnotations(book.id);
+  state.view = "reader";
+  renderShell();
+}
+
+async function deduplicateBooks() {
+  if (!confirm("Verificar duplicados e manter apenas uma copia de cada livro?")) return;
+  try {
+    const result = await api("/api/books/deduplicate", { method: "POST" });
+    await loadBooks();
+    renderLibrary();
+    if (result.removed) {
+      const lines = (result.duplicates || []).slice(0, 8).map((item) => `• Mantido: ${item.keptTitle}\n  Removido: ${item.removedTitle}`);
+      alert(`${result.removed} duplicado(s) removido(s).\n\n${lines.join("\n")}${result.duplicates?.length > 8 ? "\n..." : ""}`);
+    } else {
+      alert("Nenhum livro duplicado encontrado.");
+    }
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function renderSubjects() {
+  $("#screen").innerHTML = `
+    <header class="topbar">
+      <div>
+        <h1>Assuntos</h1>
+        <div class="muted">Cadastre assuntos para usar ao editar os metadados dos livros.</div>
+      </div>
+    </header>
+    <form class="panel form-grid" id="subjectForm">
+      <label class="wide">Novo assunto <input name="name" placeholder="Tecnologia, Romance, Negocios..." required></label>
+      <button type="submit">Cadastrar assunto</button>
+      <div class="message" id="subjectMessage"></div>
+    </form>
+    <div class="panel subject-list">
+      ${state.subjects.length
+    ? state.subjects.map((subject) => `
+          <div class="subject-row">
+            <span>${escapeHtml(subject)}</span>
+            <button class="secondary icon" data-delete-subject="${encodeURIComponent(subject)}" title="Excluir assunto">${icon("trash")}</button>
+          </div>`).join("")
+    : `<div class="empty compact">Nenhum assunto cadastrado ainda.</div>`}
+    </div>
+  `;
+  $("#subjectForm").onsubmit = async (event) => {
+    event.preventDefault();
+    const msg = $("#subjectMessage");
+    const name = String(new FormData(event.currentTarget).get("name") || "").trim();
+    try {
+      const data = await api("/api/subjects", { method: "POST", body: JSON.stringify({ name }) });
+      state.subjects = data.subjects || [];
+      renderSubjects();
+    } catch (error) {
+      msg.textContent = error.message;
+      msg.classList.add("error");
+    }
+  };
+  app.querySelectorAll("[data-delete-subject]").forEach((button) => button.onclick = async () => {
+    if (!confirm("Excluir este assunto do catalogo?")) return;
+    await api(`/api/subjects/${button.dataset.deleteSubject}`, { method: "DELETE" });
+    await loadSubjects();
+    renderSubjects();
+  });
+}
+
 function bindBookActions() {
   app.querySelectorAll("[data-select-book]").forEach((checkbox) => checkbox.onchange = () => {
     if (checkbox.checked) state.selectedBookIds.add(checkbox.dataset.selectBook);
     else state.selectedBookIds.delete(checkbox.dataset.selectBook);
     renderLibrary();
   });
-  app.querySelectorAll("[data-read]").forEach((button) => button.onclick = async () => {
-    const book = state.books.find((item) => item.id === button.dataset.read);
-    state.selectedBook = book;
-    state.chapter = Number(book.readingProgress?.position || 0);
-    await loadAnnotations(book.id);
-    state.view = "reader";
-    renderShell();
-  });
+  app.querySelectorAll("[data-read]").forEach((button) => button.onclick = () => openBook(button.dataset.read));
   app.querySelectorAll("[data-edit]").forEach((button) => button.onclick = () => showBookModal(button.dataset.edit));
   app.querySelectorAll("[data-kindle]").forEach((button) => button.onclick = () => showKindleModal(button.dataset.kindle));
   app.querySelectorAll("[data-cover]").forEach((button) => button.onclick = () => refreshCover(button.dataset.cover, button));
+  app.querySelectorAll("[data-favorite]").forEach((button) => button.onclick = async () => {
+    const book = state.books.find((item) => item.id === button.dataset.favorite);
+    if (!book) return;
+    const next = book.readingStatus === "favorite" ? "" : "favorite";
+    await api(`/api/books/${book.id}`, { method: "PATCH", body: JSON.stringify({ readingStatus: next }) });
+    book.readingStatus = next;
+    renderLibrary();
+  });
 }
 
 async function refreshCover(bookId, button) {
   button.disabled = true;
   try {
     const result = await api(`/api/books/${bookId}/cover`, { method: "POST" });
-    await loadBooks();
-    renderLibrary();
     alert(`Capa atualizada com sucesso.\nOrigem: ${result.source || "online"}.`);
+    location.reload();
   } catch (error) {
     alert(`${error.message}\n\nVerifique tambem se o servidor tem acesso a internet.`);
     button.disabled = false;
@@ -283,7 +534,7 @@ function renderUpload() {
     <header class="topbar">
       <div>
         <h1>Enviar livros</h1>
-        <div class="muted">Selecione arquivos EPUB/PDF ou uma pasta inteira para importar para Meus Livros.</div>
+        <div class="muted">Selecione arquivos EPUB/PDF ou uma pasta inteira para importar ao MyBookLib.</div>
       </div>
     </header>
     <form class="panel form-grid" id="uploadForm">
@@ -294,7 +545,7 @@ function renderUpload() {
         <span class="muted" id="fileCount">Nenhum arquivo selecionado</span>
       </div>
       <label>Assuntos <input name="subjects" placeholder="Tecnologia, Romance"></label>
-      <label>Estante <input name="shelf" placeholder="Meus Livros"></label>
+      <label>Estante <input name="shelf" placeholder="MyBookLib"></label>
       <label class="wide">Tags <input name="tags" placeholder="faculdade, consulta, favorito"></label>
       <button type="submit">${icon("upload")} Enviar</button>
       <div class="message" id="uploadMessage"></div>
@@ -344,8 +595,27 @@ function renderUpload() {
 
 function showBookModal(bookId) {
   const book = state.books.find((item) => item.id === bookId);
+  const selectedSubjects = [...(book.subjects || [])];
+  const subjectOptions = catalogSubjects();
   const modal = document.createElement("div");
   modal.className = "modal";
+  const renderSubjectChips = () => {
+    const box = $("#subjectChips", modal);
+    if (!box) return;
+    box.innerHTML = selectedSubjects.length
+      ? selectedSubjects.map((subject, index) => `
+          <span class="chip removable">
+            ${escapeHtml(subject)}
+            <button type="button" data-remove-subject="${index}" aria-label="Remover assunto">x</button>
+          </span>`).join("")
+      : `<span class="muted">Nenhum assunto selecionado.</span>`;
+    box.querySelectorAll("[data-remove-subject]").forEach((button) => {
+      button.onclick = () => {
+        selectedSubjects.splice(Number(button.dataset.removeSubject), 1);
+        renderSubjectChips();
+      };
+    });
+  };
   modal.innerHTML = `
     <form class="modal-body form-grid" id="bookForm">
       <h2 class="wide">Editar livro</h2>
@@ -355,7 +625,25 @@ function showBookModal(bookId) {
       <label>ISBN <input name="isbn" value="${escapeHtml(book.isbn)}"></label>
       <label>Idioma <input name="language" value="${escapeHtml(book.language)}"></label>
       <label>Estante <input name="shelf" value="${escapeHtml(book.shelf)}"></label>
-      <label class="wide">Assuntos <input name="subjects" value="${escapeHtml((book.subjects || []).join(", "))}"></label>
+      <label class="wide">Assunto
+        <select id="subjectPicker">
+          <option value="">Selecione um assunto cadastrado</option>
+          ${subjectOptions.map((subject) => `<option value="${escapeHtml(subject)}">${escapeHtml(subject)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="wide subject-picker-actions">
+        <button type="button" class="secondary" id="addSubjectToBook">Adicionar assunto</button>
+        <button type="button" class="secondary" id="goSubjectsFromModal">Gerenciar assuntos</button>
+      </div>
+      <div class="wide chips" id="subjectChips"></div>
+      <label class="wide">Status de leitura
+        <select name="readingStatus">
+          <option value="" ${!book.readingStatus ? "selected" : ""}>Em leitura</option>
+          <option value="favorite" ${book.readingStatus === "favorite" ? "selected" : ""}>Favorito</option>
+          <option value="planned" ${book.readingStatus === "planned" ? "selected" : ""}>Planejado</option>
+          <option value="completed" ${book.readingStatus === "completed" ? "selected" : ""}>Concluido</option>
+        </select>
+      </label>
       <label class="wide">Tags <input name="tags" value="${escapeHtml((book.tags || []).join(", "))}"></label>
       <button type="submit">Salvar</button>
       <button type="button" class="danger" id="deleteBook">${icon("trash")} Excluir</button>
@@ -363,6 +651,19 @@ function showBookModal(bookId) {
     </form>
   `;
   document.body.appendChild(modal);
+  renderSubjectChips();
+  $("#addSubjectToBook", modal).onclick = () => {
+    const value = $("#subjectPicker", modal).value.trim();
+    if (!value) return;
+    if (!selectedSubjects.includes(value)) selectedSubjects.push(value);
+    $("#subjectPicker", modal).value = "";
+    renderSubjectChips();
+  };
+  $("#goSubjectsFromModal", modal).onclick = () => {
+    modal.remove();
+    state.view = "subjects";
+    renderShell();
+  };
   $("#closeModal", modal).onclick = () => modal.remove();
   $("#deleteBook", modal).onclick = async () => {
     if (!confirm("Excluir este livro da biblioteca?")) return;
@@ -374,10 +675,10 @@ function showBookModal(bookId) {
   $("#bookForm", modal).onsubmit = async (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    data.subjects = String(data.subjects || "").split(",").map((x) => x.trim()).filter(Boolean);
+    data.subjects = selectedSubjects;
     data.tags = String(data.tags || "").split(",").map((x) => x.trim()).filter(Boolean);
     await api(`/api/books/${book.id}`, { method: "PATCH", body: JSON.stringify(data) });
-    await loadBooks();
+    await Promise.all([loadBooks(), loadSubjects()]);
     modal.remove();
     renderShell();
   };
@@ -500,6 +801,14 @@ function renderReader() {
   };
   if (isEpub) bindEpubReader(book);
   bindAnnotations(book);
+  const onReaderKeydown = (event) => {
+    if (!isEpub || event.target.closest("textarea, input, select")) return;
+    if (event.key === "ArrowLeft") $("#prevChapter")?.click();
+    if (event.key === "ArrowRight") $("#nextChapter")?.click();
+    if (event.key === "Escape") $("#backToLibrary")?.click();
+  };
+  document.addEventListener("keydown", onReaderKeydown);
+  $("#backToLibrary").addEventListener("click", () => document.removeEventListener("keydown", onReaderKeydown), { once: true });
 }
 
 async function deleteSelectedBooks() {
