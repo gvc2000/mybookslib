@@ -652,13 +652,16 @@ function showBookModal(bookId) {
   `;
   document.body.appendChild(modal);
   renderSubjectChips();
-  $("#addSubjectToBook", modal).onclick = () => {
+  const addSelectedSubject = () => {
     const value = $("#subjectPicker", modal).value.trim();
-    if (!value) return;
+    if (!value) return false;
     if (!selectedSubjects.includes(value)) selectedSubjects.push(value);
     $("#subjectPicker", modal).value = "";
     renderSubjectChips();
+    return true;
   };
+  $("#subjectPicker", modal).onchange = addSelectedSubject;
+  $("#addSubjectToBook", modal).onclick = addSelectedSubject;
   $("#goSubjectsFromModal", modal).onclick = () => {
     modal.remove();
     state.view = "subjects";
@@ -674,6 +677,7 @@ function showBookModal(bookId) {
   };
   $("#bookForm", modal).onsubmit = async (event) => {
     event.preventDefault();
+    addSelectedSubject();
     const data = Object.fromEntries(new FormData(event.currentTarget));
     data.subjects = selectedSubjects;
     data.tags = String(data.tags || "").split(",").map((x) => x.trim()).filter(Boolean);
