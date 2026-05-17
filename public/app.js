@@ -1,15 +1,22 @@
 const state = {
   user: null,
   books: [],
+  recent: [],
   users: [],
   subjects: [],
+  tags: [],
   view: "library",
   selectedBook: null,
   selectedBookIds: new Set(),
   chapter: 0,
   annotations: [],
+  readerPanel: "",
+  readerSettings: JSON.parse(localStorage.getItem("mybooklib-reader-settings") || "{\"theme\":\"paper\",\"fontSize\":18,\"contentWidth\":980,\"lineHeight\":1.65,\"publisherDefaults\":true,\"verticalScroll\":false,\"columns\":false,\"pdfZoom\":100}"),
+  readerSearch: "",
+  pendingBulkSubject: "",
   libraryScope: "mine",
-  filters: { q: "", subject: "", format: "", shelfTab: "all" },
+  pagination: { page: 1, pageSize: 60, total: 0, totalPages: 1 },
+  filters: { q: "", subject: "", tag: "", format: "", shelfTab: "all" },
   theme: localStorage.getItem("mybooklib-theme") || "light"
 };
 
@@ -53,7 +60,7 @@ function readingMeta(book) {
 }
 
 function recentBooks(limit = 12) {
-  return [...state.books]
+  return [...state.recent]
     .filter((book) => book.lastOpenedAt)
     .sort((a, b) => new Date(b.lastOpenedAt) - new Date(a.lastOpenedAt))
     .slice(0, limit);
@@ -66,7 +73,7 @@ function progressRing(percent) {
 }
 
 function bookDescription(book) {
-  return String(book.description || "").trim() || "Sinopse ainda nao encontrada para este livro.";
+  return String(book.description || "").trim() || book.metadataError || "Sinopse ainda nao encontrada para este livro.";
 }
 
 function bookMetadataRows(book) {
@@ -87,6 +94,24 @@ function bookMetadataRows(book) {
   `).join("");
 }
 
+function bookTagsMarkup(book) {
+  const tags = (book.tags || []).filter(Boolean).slice(0, 10);
+  if (!tags.length) return "";
+  return `
+    <div class="preview-section-title">Tags</div>
+    <div class="preview-tags">${tags.map((tag) => `<button type="button" data-tag-filter="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`).join("")}</div>
+  `;
+}
+
+function bookCardTagsMarkup(book) {
+  const tags = (book.tags || []).filter(Boolean).slice(0, 3);
+  return tags.length ? `<div class="book-tags">${tags.map((tag) => `<button type="button" data-tag-filter="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`).join("")}</div>` : "";
+}
+
+function saveReaderSettings() {
+  localStorage.setItem("mybooklib-reader-settings", JSON.stringify(state.readerSettings));
+}
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const app = $("#app");
 
@@ -105,6 +130,7 @@ function escapeHtml(value) {
 function icon(name) {
   const icons = {
     book: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z",
+    search: "M21 21l-4.35-4.35 M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15z",
     upload: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M17 8l-5-5-5 5 M12 3v12",
     users: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M22 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75",
     edit: "M12 20h9 M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z",
@@ -124,7 +150,7 @@ async function boot() {
   const { user } = await api("/api/me");
   state.user = user;
   if (!user) return renderLogin();
-  await Promise.all([loadBooks(), loadSubjects()]);
+  await Promise.all([loadBooks(), loadSubjects(), loadTags(), loadRecentBooks()]);
   renderShell();
 }
 
@@ -153,7 +179,7 @@ function renderLogin() {
     try {
       const { user } = await api("/api/login", { method: "POST", body: JSON.stringify(Object.fromEntries(form)) });
       state.user = user;
-      await loadBooks();
+      await Promise.all([loadBooks(), loadSubjects(), loadTags(), loadRecentBooks()]);
       renderShell();
     } catch (error) {
       $("#loginMessage").textContent = error.message;
@@ -163,9 +189,37 @@ function renderLogin() {
 }
 
 async function loadBooks() {
-  const query = state.user?.role === "admin" && state.libraryScope === "all" ? "?scope=all" : "";
+  const params = new URLSearchParams({
+    page: String(state.pagination.page),
+    pageSize: String(state.pagination.pageSize),
+    shelfTab: state.filters.shelfTab || "all"
+  });
+  if (state.user?.role === "admin" && state.libraryScope === "all") params.set("scope", "all");
+  if (state.filters.q) params.set("q", state.filters.q);
+  if (state.filters.subject) params.set("subject", state.filters.subject);
+  if (state.filters.tag) params.set("tag", state.filters.tag);
+  if (state.filters.format) params.set("format", state.filters.format);
+  const query = `?${params.toString()}`;
   const data = await api(`/api/books${query}`);
-  state.books = data.books;
+  state.books = data.books || [];
+  state.pagination = {
+    page: Number(data.page || 1),
+    pageSize: Number(data.pageSize || state.pagination.pageSize),
+    total: Number(data.total || state.books.length),
+    totalPages: Number(data.totalPages || 1)
+  };
+}
+
+async function loadRecentBooks() {
+  const query = state.user?.role === "admin" && state.libraryScope === "all" ? "?scope=all&limit=12" : "?limit=12";
+  const data = await api(`/api/books/recent${query}`);
+  state.recent = data.books || [];
+}
+
+async function loadTags() {
+  const query = state.user?.role === "admin" && state.libraryScope === "all" ? "?scope=all" : "";
+  const data = await api(`/api/tags${query}`);
+  state.tags = data.tags || [];
 }
 
 async function loadAnnotations(bookId) {
@@ -198,7 +252,7 @@ function renderShell() {
       <div class="main-layout">
         <aside class="sidebar">
           <nav class="nav">
-            <button class="${state.view === "library" ? "active" : ""}" data-view="library">Todo conteudo <span>${state.books.length}</span></button>
+            <button class="${state.view === "library" ? "active" : ""}" data-view="library">Todo conteudo <span>${state.pagination.total || state.books.length}</span></button>
             <button data-view="upload">Envio Kindle</button>
             <button class="${state.view === "subjects" ? "active" : ""}" data-view="subjects">Assuntos <span>${state.subjects.length}</span></button>
           </nav>
@@ -264,21 +318,36 @@ function catalogSubjects() {
   return [...merged.values()].sort((a, b) => a.localeCompare(b, "pt-BR"));
 }
 
+function catalogTags() {
+  return [...new Set(state.tags || [])].sort((a, b) => a.localeCompare(b, "pt-BR"));
+}
+
 function bookMatchesSubject(book, filterSubject) {
   const needle = subjectKey(filterSubject);
   if (!needle) return true;
   return (book.subjects || []).some((item) => subjectKey(item) === needle);
 }
 
+function bookMatchesTag(book, filterTag) {
+  const needle = subjectKey(filterTag);
+  if (!needle) return true;
+  return (book.tags || []).some((item) => subjectKey(item) === needle);
+}
+
 function filteredBooks() {
-  const q = state.filters.q.toLowerCase().trim();
-  return state.books.filter((book) => {
-    const haystack = [book.title, book.author, book.publisher, book.shelf, ...(book.subjects || []), ...(book.tags || [])].join(" ").toLowerCase();
-    return (!q || haystack.includes(q)) &&
-      bookMatchesSubject(book, state.filters.subject) &&
-      (!state.filters.format || book.format === state.filters.format) &&
-      bookMatchesShelfTab(book, state.filters.shelfTab);
-  });
+  return state.books;
+}
+
+let librarySearchTimer = null;
+
+async function reloadLibrary({ resetPage = false, refreshRecent = false } = {}) {
+  if (resetPage) state.pagination.page = 1;
+  await Promise.all([
+    loadBooks(),
+    loadTags(),
+    refreshRecent ? loadRecentBooks() : Promise.resolve()
+  ]);
+  if (state.view === "library") renderLibrary();
 }
 
 function shelfTabsMarkup() {
@@ -304,6 +373,26 @@ function renderRecentlyOpened() {
       </div>
       <div class="recent-track">${recent.map(recentBookCard).join("")}</div>
     </section>
+  `;
+}
+
+function renderPagination() {
+  const { page, pageSize, total, totalPages } = state.pagination;
+  if (!total) return "";
+  const first = (page - 1) * pageSize + 1;
+  const last = Math.min(total, page * pageSize);
+  return `
+    <div class="pagination-bar">
+      <span>Mostrando ${first}-${last} de ${total}</span>
+      <div class="pagination-actions">
+        <button class="secondary" id="prevPage" ${page <= 1 ? "disabled" : ""}>Anterior</button>
+        <strong>Pagina ${page} de ${totalPages}</strong>
+        <button class="secondary" id="nextPage" ${page >= totalPages ? "disabled" : ""}>Proxima</button>
+        <select id="pageSize" class="filter-select" title="Livros por pagina">
+          ${[30, 60, 90, 120].map((size) => `<option value="${size}" ${pageSize === size ? "selected" : ""}>${size} por pagina</option>`).join("")}
+        </select>
+      </div>
+    </div>
   `;
 }
 
@@ -338,13 +427,14 @@ function decodeFilterValue(value) {
 
 function renderLibrary() {
   const subjects = catalogSubjects();
+  const tags = catalogTags();
   const books = filteredBooks();
-  const recent = recentBooks();
+  const totalBooks = state.pagination.total || books.length;
   $("#screen").innerHTML = `
     <header class="topbar topbar-compact">
       <div>
         <h1>${state.libraryScope === "all" ? "Acervo completo" : "Minha estante"}</h1>
-        <div class="muted">${state.books.length} livro(s) · ${books.length} visiveis</div>
+        <div class="muted">${totalBooks} livro(s) - ${books.length} nesta pagina</div>
       </div>
       <div class="topbar-actions">
         <button class="secondary subtle" id="dedupeBooks" title="Remover duplicados">${icon("book")}</button>
@@ -371,6 +461,13 @@ function renderLibrary() {
           return `<option value="${encodeURIComponent(subject)}" ${selected ? "selected" : ""}>${escapeHtml(subject)}</option>`;
         }).join("")}
       </select>
+      <select id="tagFilter" class="filter-select">
+        <option value="">Tag</option>
+        ${tags.map((tag) => {
+          const selected = subjectKey(tag) === subjectKey(state.filters.tag);
+          return `<option value="${encodeURIComponent(tag)}" ${selected ? "selected" : ""}>${escapeHtml(tag)}</option>`;
+        }).join("")}
+      </select>
       <div class="search-wrap">${icon("book")} <input id="search" placeholder="Buscar livro..." value="${escapeHtml(state.filters.q)}"></div>
       <select id="formatFilter" class="filter-select">
         <option value="">Formato</option>
@@ -379,17 +476,29 @@ function renderLibrary() {
       </select>
       <button class="secondary icon" id="clearFilters" title="Limpar filtros">x</button>
     </div>
+    <div class="bulk-subject-bar">
+      <strong>${state.selectedBookIds.size} selecionado(s)</strong>
+      <input id="bulkSubjectInput" list="bulkSubjectOptions" placeholder="Assunto para aplicar em lote" value="${escapeHtml(state.pendingBulkSubject)}">
+      <datalist id="bulkSubjectOptions">
+        ${subjects.map((subject) => `<option value="${escapeHtml(subject)}"></option>`).join("")}
+      </datalist>
+      <button id="applyBulkSubject" ${state.selectedBookIds.size ? "" : "disabled"}>Aplicar assunto</button>
+      <button class="secondary" id="clearBookSelection" ${state.selectedBookIds.size ? "" : "disabled"}>Limpar selecao</button>
+      <span class="message" id="bulkSubjectMessage"></span>
+    </div>
     <div class="content-head">
-      <h3>Todo o conteudo <span class="muted">${books.length}</span></h3>
+      <h3>Todo o conteudo <span class="muted">${totalBooks}</span></h3>
       ${normalizeSubjectLabel(state.filters.subject) ? `<span class="filter-pill">Assunto: ${escapeHtml(normalizeSubjectLabel(state.filters.subject))}</span>` : ""}
+      ${normalizeSubjectLabel(state.filters.tag) ? `<span class="filter-pill">Tag: ${escapeHtml(normalizeSubjectLabel(state.filters.tag))}</span>` : ""}
     </div>
     ${books.length ? `<section class="card-grid card-grid-compact">${books.map(bookCard).join("")}</section>` : `<div class="empty compact">Nenhum livro encontrado com os filtros atuais.</div>`}
+    ${renderPagination()}
     </div>
   `;
   $("#dedupeBooks").onclick = deduplicateBooks;
-  app.querySelectorAll("[data-shelf-tab]").forEach((button) => button.onclick = () => {
+  app.querySelectorAll("[data-shelf-tab]").forEach((button) => button.onclick = async () => {
     state.filters.shelfTab = button.dataset.shelfTab;
-    renderLibrary();
+    await reloadLibrary({ resetPage: true });
   });
   $("#deleteSelected").onclick = deleteSelectedBooks;
   $("#selectAllBooks")?.addEventListener("change", (event) => {
@@ -399,17 +508,44 @@ function renderLibrary() {
   });
   $("#scopeFilter")?.addEventListener("change", async (event) => {
     state.libraryScope = event.target.value;
-    await loadBooks();
-    renderLibrary();
+    await reloadLibrary({ resetPage: true, refreshRecent: true });
   });
-  $("#search").oninput = (event) => { state.filters.q = event.target.value; renderLibrary(); };
-  $("#subjectFilter").onchange = (event) => {
-    state.filters.subject = normalizeSubjectLabel(decodeFilterValue(event.target.value));
-    renderLibrary();
+  $("#search").oninput = (event) => {
+    state.filters.q = event.target.value;
+    clearTimeout(librarySearchTimer);
+    librarySearchTimer = setTimeout(() => reloadLibrary({ resetPage: true }), 250);
   };
-  $("#formatFilter").onchange = (event) => { state.filters.format = event.target.value; renderLibrary(); };
-  $("#clearFilters").onclick = () => {
-    state.filters = { q: "", subject: "", format: "", shelfTab: state.filters.shelfTab };
+  $("#subjectFilter").onchange = async (event) => {
+    state.filters.subject = normalizeSubjectLabel(decodeFilterValue(event.target.value));
+    await reloadLibrary({ resetPage: true });
+  };
+  $("#tagFilter").onchange = async (event) => {
+    state.filters.tag = normalizeSubjectLabel(decodeFilterValue(event.target.value));
+    await reloadLibrary({ resetPage: true });
+  };
+  $("#formatFilter").onchange = async (event) => {
+    state.filters.format = event.target.value;
+    await reloadLibrary({ resetPage: true });
+  };
+  $("#clearFilters").onclick = async () => {
+    state.filters = { q: "", subject: "", tag: "", format: "", shelfTab: state.filters.shelfTab };
+    await reloadLibrary({ resetPage: true });
+  };
+  $("#prevPage")?.addEventListener("click", async () => {
+    state.pagination.page = Math.max(1, state.pagination.page - 1);
+    await reloadLibrary();
+  });
+  $("#nextPage")?.addEventListener("click", async () => {
+    state.pagination.page = Math.min(state.pagination.totalPages, state.pagination.page + 1);
+    await reloadLibrary();
+  });
+  $("#pageSize")?.addEventListener("change", async (event) => {
+    state.pagination.pageSize = Number(event.target.value);
+    await reloadLibrary({ resetPage: true });
+  });
+  $("#applyBulkSubject").onclick = applyBulkSubject;
+  $("#clearBookSelection").onclick = () => {
+    state.selectedBookIds.clear();
     renderLibrary();
   };
   bindBookActions();
@@ -432,12 +568,9 @@ function bookCard(book) {
         <div class="preview-body">
           <div class="preview-author">${escapeHtml(book.author || "Autor desconhecido")}</div>
           <h3>${escapeHtml(book.title || book.originalName)}</h3>
-          <div class="preview-actions">
-            <button type="button" data-read="${book.id}" tabindex="-1">Ler</button>
-            <a class="button secondary" href="/files/${book.id}?download=1" download tabindex="-1">Download (${escapeHtml(formatFileSize(book.fileSize) || book.format.toUpperCase())})</a>
-          </div>
           <div class="preview-section-title">Sinopse</div>
           <p class="preview-description">${escapeHtml(bookDescription(book))}</p>
+          ${bookTagsMarkup(book)}
           ${previewMeta ? `<div class="preview-meta">${previewMeta}</div>` : ""}
         </div>
       </aside>
@@ -446,10 +579,11 @@ function bookCard(book) {
         <div class="book-title">${escapeHtml(book.title || book.originalName)}</div>
         ${owner}
         <div class="book-meta">${readingMeta(book)}</div>
+        ${bookCardTagsMarkup(book)}
         <div class="actions">
           <button data-read="${book.id}">Ler</button>
           <a class="button secondary icon" title="Download" href="/files/${book.id}?download=1" download>${icon("download")}</a>
-          <button class="secondary icon" title="Buscar capa online" data-cover="${book.id}">${icon("book")}</button>
+          <button class="secondary icon" title="Buscar metadados online" data-cover="${book.id}">${icon("book")}</button>
           <button class="secondary icon" title="Editar" data-edit="${book.id}">${icon("edit")}</button>
           <button class="secondary icon" title="Kindle" data-kindle="${book.id}">${icon("send")}</button>
         </div>
@@ -461,16 +595,51 @@ function bookCard(book) {
 function positionBookPreview(card, event) {
   const preview = $(".book-preview", card);
   if (!preview || window.matchMedia("(max-width: 820px)").matches) return;
-  const width = Math.min(560, window.innerWidth - 32);
-  const height = Math.min(520, window.innerHeight - 32);
-  const x = Math.min(event.clientX + 18, window.innerWidth - width - 16);
-  const y = Math.min(Math.max(16, event.clientY - 22), window.innerHeight - height - 16);
+  const width = Math.min(520, window.innerWidth - 32);
+  const height = Math.min(460, window.innerHeight - 32);
+  const rect = card.getBoundingClientRect();
+  const openLeft = rect.left > window.innerWidth / 2;
+  const desiredX = openLeft ? rect.left - width - 18 : rect.right + 18;
+  const x = Math.min(Math.max(16, desiredX), window.innerWidth - width - 16);
+  const y = Math.min(Math.max(16, rect.top - 10), window.innerHeight - height - 16);
   preview.style.setProperty("--preview-x", `${Math.max(16, x)}px`);
   preview.style.setProperty("--preview-y", `${Math.max(16, y)}px`);
 }
 
+async function applyBulkSubject() {
+  const msg = $("#bulkSubjectMessage");
+  const subject = normalizeSubjectLabel($("#bulkSubjectInput")?.value);
+  const bookIds = [...state.selectedBookIds];
+  msg.textContent = "";
+  msg.classList.remove("error");
+  if (!subject) {
+    msg.textContent = "Informe um assunto.";
+    msg.classList.add("error");
+    return;
+  }
+  if (!bookIds.length) {
+    msg.textContent = "Selecione livros antes de aplicar.";
+    msg.classList.add("error");
+    return;
+  }
+  try {
+    const result = await api("/api/books/subjects", { method: "PATCH", body: JSON.stringify({ subject, bookIds }) });
+    state.filters.subject = subject;
+    state.pagination.page = 1;
+    await Promise.all([loadBooks(), loadSubjects(), loadTags()]);
+    state.pendingBulkSubject = "";
+    state.selectedBookIds.clear();
+    renderLibrary();
+    const nextMsg = $("#bulkSubjectMessage");
+    if (nextMsg) nextMsg.textContent = `${result.updated} livro(s) atualizado(s).`;
+  } catch (error) {
+    msg.textContent = error.message;
+    msg.classList.add("error");
+  }
+}
+
 async function openBook(bookId) {
-  const book = state.books.find((item) => item.id === bookId);
+  const book = state.books.find((item) => item.id === bookId) || state.recent.find((item) => item.id === bookId);
   if (!book) return;
   try {
     const data = await api(`/api/books/${bookId}/open`, { method: "POST" });
@@ -489,7 +658,7 @@ async function deduplicateBooks() {
   if (!confirm("Verificar duplicados e manter apenas uma copia de cada livro?")) return;
   try {
     const result = await api("/api/books/deduplicate", { method: "POST" });
-    await loadBooks();
+    await Promise.all([loadBooks(), loadTags(), loadRecentBooks()]);
     renderLibrary();
     if (result.removed) {
       const lines = (result.duplicates || []).slice(0, 8).map((item) => `• Mantido: ${item.keptTitle}\n  Removido: ${item.removedTitle}`);
@@ -520,6 +689,7 @@ function renderSubjects() {
     ? state.subjects.map((subject) => `
           <div class="subject-row">
             <span>${escapeHtml(subject)}</span>
+            <button class="secondary" data-use-subject="${encodeURIComponent(subject)}">Usar na estante</button>
             <button class="secondary icon" data-delete-subject="${encodeURIComponent(subject)}" title="Excluir assunto">${icon("trash")}</button>
           </div>`).join("")
     : `<div class="empty compact">Nenhum assunto cadastrado ainda.</div>`}
@@ -544,12 +714,27 @@ function renderSubjects() {
     await loadSubjects();
     renderSubjects();
   });
+  app.querySelectorAll("[data-use-subject]").forEach((button) => button.onclick = async () => {
+    state.pendingBulkSubject = decodeFilterValue(button.dataset.useSubject);
+    state.filters.subject = "";
+    state.filters.tag = "";
+    state.filters.q = "";
+    state.filters.format = "";
+    state.pagination.page = 1;
+    await reloadLibrary({ resetPage: true });
+    state.view = "library";
+    renderShell();
+  });
 }
 
 function bindBookActions() {
   app.querySelectorAll(".book-card").forEach((card) => {
     card.addEventListener("mouseenter", (event) => positionBookPreview(card, event));
     card.addEventListener("mousemove", (event) => positionBookPreview(card, event));
+  });
+  app.querySelectorAll("[data-tag-filter]").forEach((button) => button.onclick = async () => {
+    state.filters.tag = button.dataset.tagFilter;
+    await reloadLibrary({ resetPage: true });
   });
   app.querySelectorAll("[data-select-book]").forEach((checkbox) => checkbox.onchange = () => {
     if (checkbox.checked) state.selectedBookIds.add(checkbox.dataset.selectBook);
@@ -574,11 +759,37 @@ async function refreshCover(bookId, button) {
   button.disabled = true;
   try {
     const result = await api(`/api/books/${bookId}/cover`, { method: "POST" });
-    alert(`Capa atualizada com sucesso.\nOrigem: ${result.source || "online"}.`);
-    location.reload();
+    await Promise.all([loadBooks(), loadTags()]);
+    renderLibrary();
+    alert(`Metadados atualizados com sucesso.\nOrigem: ${result.source || "online"}.`);
   } catch (error) {
     alert(`${error.message}\n\nVerifique tambem se o servidor tem acesso a internet.`);
     button.disabled = false;
+  }
+}
+
+function processingKey(bookIds) {
+  return bookIds.map((id) => {
+    const book = state.books.find((item) => item.id === id);
+    if (!book) return `${id}:missing`;
+    return [book.id, book.status, book.updatedAt, book.coverUrl, book.coverSource, book.metadataSource, book.description, (book.tags || []).join("|")].join(":");
+  }).join(";");
+}
+
+async function monitorImportedBooks(bookIds) {
+  const ids = [...new Set((bookIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  let previousKey = processingKey(ids);
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const pending = state.books.some((book) => ids.includes(book.id) && ["uploaded", "processing"].includes(book.status));
+    if (!pending && attempt > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await loadBooks();
+    const nextKey = processingKey(ids);
+    if (state.view === "library" && nextKey !== previousKey) {
+      previousKey = nextKey;
+      renderLibrary();
+    }
   }
 }
 
@@ -631,14 +842,27 @@ function renderUpload() {
     msg.textContent = "Enviando e processando livros...";
     msg.classList.remove("error");
     try {
-      const form = new FormData(event.currentTarget);
-      form.delete("file");
-      files.forEach((file) => form.append("file", file, file.webkitRelativePath || file.name));
-      const result = await api("/api/books", { method: "POST", body: form });
-      await loadBooks();
+      const baseForm = new FormData(event.currentTarget);
+      baseForm.delete("file");
+      const imported = [];
+      const errors = [];
+      const batchSize = 20;
+      for (let start = 0; start < files.length; start += batchSize) {
+        const batch = files.slice(start, start + batchSize);
+        const form = new FormData();
+        for (const [key, value] of baseForm.entries()) form.append(key, value);
+        batch.forEach((file) => form.append("file", file, file.webkitRelativePath || file.name));
+        msg.textContent = `Enviando lote ${Math.floor(start / batchSize) + 1} de ${Math.ceil(files.length / batchSize)} (${Math.min(start + batch.length, files.length)}/${files.length})...`;
+        const result = await api("/api/books", { method: "POST", body: form });
+        imported.push(...(result.books || [result.book]).filter(Boolean));
+        errors.push(...(result.errors || []));
+      }
+      state.pagination.page = 1;
+      await Promise.all([loadBooks(), loadTags(), loadRecentBooks()]);
       state.view = "library";
       renderShell();
-      if (result.errors?.length) alert(result.errors.join("\n"));
+      monitorImportedBooks(imported.map((book) => book?.id));
+      if (errors.length) alert(errors.join("\n"));
     } catch (error) {
       msg.textContent = error.message;
       msg.classList.add("error");
@@ -682,10 +906,10 @@ function showBookModal(bookId) {
       <label>Estante <input name="shelf" value="${escapeHtml(book.shelf)}"></label>
       <label class="wide">Sinopse <textarea name="description" rows="5">${escapeHtml(book.description)}</textarea></label>
       <label class="wide">Assunto
-        <select id="subjectPicker">
-          <option value="">Selecione um assunto cadastrado</option>
-          ${subjectOptions.map((subject) => `<option value="${escapeHtml(subject)}">${escapeHtml(subject)}</option>`).join("")}
-        </select>
+        <input id="subjectPicker" list="subjectOptions" placeholder="Escolha ou digite um assunto">
+        <datalist id="subjectOptions">
+          ${subjectOptions.map((subject) => `<option value="${escapeHtml(subject)}"></option>`).join("")}
+        </datalist>
       </label>
       <div class="wide subject-picker-actions">
         <button type="button" class="secondary" id="addSubjectToBook">Adicionar assunto</button>
@@ -716,7 +940,6 @@ function showBookModal(bookId) {
     renderSubjectChips();
     return true;
   };
-  $("#subjectPicker", modal).onchange = addSelectedSubject;
   $("#addSubjectToBook", modal).onclick = addSelectedSubject;
   $("#goSubjectsFromModal", modal).onclick = () => {
     modal.remove();
@@ -727,7 +950,7 @@ function showBookModal(bookId) {
   $("#deleteBook", modal).onclick = async () => {
     if (!confirm("Excluir este livro da biblioteca?")) return;
     await api(`/api/books/${book.id}`, { method: "DELETE" });
-    await loadBooks();
+    await Promise.all([loadBooks(), loadTags(), loadRecentBooks()]);
     modal.remove();
     renderShell();
   };
@@ -738,7 +961,7 @@ function showBookModal(bookId) {
     data.subjects = selectedSubjects;
     data.tags = String(data.tags || "").split(",").map((x) => x.trim()).filter(Boolean);
     await api(`/api/books/${book.id}`, { method: "PATCH", body: JSON.stringify(data) });
-    await Promise.all([loadBooks(), loadSubjects()]);
+    await Promise.all([loadBooks(), loadSubjects(), loadTags()]);
     modal.remove();
     renderShell();
   };
@@ -837,34 +1060,83 @@ function userRow(user) {
 function renderReader() {
   const book = state.selectedBook;
   const isEpub = book.format === "epub";
+  if (state.readerSettings.contentWidth < 900) state.readerSettings.contentWidth = 980;
+  const max = Math.max(0, (book.epub?.spine?.length || 1) - 1);
+  const percent = Math.round(book.readingProgress?.percent ?? (max ? (state.chapter / max) * 100 : 0));
+  const panelOpen = state.readerPanel ? "panel-open" : "";
   app.innerHTML = `
-    <section class="reader">
-      <header class="reader-bar">
-        <button class="secondary icon" id="backToLibrary" title="Voltar">${icon("left")}</button>
+    <section class="reader reader-${state.readerSettings.theme} ${panelOpen}" style="--reader-font:${state.readerSettings.fontSize}px;--reader-width:${state.readerSettings.contentWidth}px;--reader-line:${state.readerSettings.lineHeight};--pdf-zoom:${state.readerSettings.pdfZoom / 100}">
+      <header class="reader-topbar">
+        <div class="reader-left">
+          <button class="reader-icon" id="backToLibrary" title="Voltar">${icon("left")}</button>
+          <button class="reader-icon ${state.readerPanel === "search" ? "active" : ""}" data-reader-panel="search" title="Buscar">${icon("search")}</button>
+        </div>
         <div class="reader-title">${escapeHtml(book.title || book.originalName)}</div>
-        <div class="reader-actions">
-          ${isEpub ? `<button class="secondary icon" id="prevChapter" title="Anterior">${icon("left")}</button><span>${state.chapter + 1}/${book.epub?.spine?.length || 1}</span><button class="secondary icon" id="nextChapter" title="Proximo">${icon("right")}</button>` : ""}
+        <div class="reader-tools">
+          <button class="reader-icon ${state.readerPanel === "notes" ? "active" : ""}" data-reader-panel="notes" title="Anotacoes">${icon("bell")}</button>
+          <button class="reader-icon ${state.readerPanel === "contents" ? "active" : ""}" data-reader-panel="contents" title="Conteudo">${icon("book")}</button>
+          <button class="reader-icon ${state.readerPanel === "appearance" ? "active" : ""}" data-reader-panel="appearance" title="Aparencia">A</button>
+          <button class="reader-icon" id="readerFullscreen" title="Tela cheia">⛶</button>
         </div>
       </header>
-      <div class="reader-layout">
-        ${isEpub ? epubReader(book) : `<iframe class="pdf-frame" src="/files/${book.id}"></iframe>`}
-        ${annotationPanel(book)}
+      <div class="reader-stage">
+        ${state.readerPanel ? readerSidePanel(book) : ""}
+        <button class="page-turn page-prev" id="prevChapter" title="Anterior" ${isEpub ? "" : "disabled"}>${icon("left")}</button>
+        <main class="reader-page">
+          ${isEpub ? epubReader(book) : `<div class="pdf-shell"><iframe class="pdf-frame" src="/files/${book.id}"></iframe></div>`}
+        </main>
+        <button class="page-turn page-next" id="nextChapter" title="Proximo" ${isEpub ? "" : "disabled"}>${icon("right")}</button>
       </div>
+      <footer class="reader-progressbar">
+        <button class="reader-play" id="readerPlay" title="Continuar">▶</button>
+        <button class="reader-more" title="Mais">...</button>
+        <div class="reader-progress-track">
+          <input id="readerProgress" type="range" min="0" max="${max}" value="${state.chapter}" ${isEpub ? "" : "disabled"}>
+          <div class="reader-progress-label">${escapeHtml(book.readingProgress?.label || (isEpub ? `Capitulo ${state.chapter + 1}` : "PDF"))}</div>
+        </div>
+        ${isEpub ? `<div class="reader-nav-buttons"><button id="readerPrevBottom">Anterior</button><button id="readerNextBottom">Proximo</button></div>` : ""}
+        <div class="reader-progress-percent">${isEpub ? `${percent}%` : book.format.toUpperCase()}</div>
+      </footer>
     </section>
   `;
   $("#backToLibrary").onclick = async () => {
     state.view = "library";
     state.selectedBook = null;
     state.annotations = [];
-    await loadBooks();
+    await Promise.all([loadBooks(), loadRecentBooks()]);
     renderShell();
+  };
+  app.querySelectorAll("[data-reader-panel]").forEach((button) => button.onclick = () => {
+    state.readerPanel = state.readerPanel === button.dataset.readerPanel ? "" : button.dataset.readerPanel;
+    renderReader();
+  });
+  $("#readerFullscreen").onclick = () => {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+    else document.exitFullscreen?.();
   };
   if (isEpub) bindEpubReader(book);
   bindAnnotations(book);
+  bindReaderPanels(book);
   const onReaderKeydown = (event) => {
     if (!isEpub || event.target.closest("textarea, input, select")) return;
-    if (event.key === "ArrowLeft") $("#prevChapter")?.click();
-    if (event.key === "ArrowRight") $("#nextChapter")?.click();
+    if (["ArrowLeft", "PageUp"].includes(event.key)) {
+      event.preventDefault();
+      $("#prevChapter")?.click();
+    }
+    if (["ArrowRight", "PageDown", " "].includes(event.key)) {
+      event.preventDefault();
+      $("#nextChapter")?.click();
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      state.chapter = 0;
+      saveReaderProgress(book).then(() => renderReader());
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      state.chapter = max;
+      saveReaderProgress(book).then(() => renderReader());
+    }
     if (event.key === "Escape") $("#backToLibrary")?.click();
   };
   document.addEventListener("keydown", onReaderKeydown);
@@ -879,7 +1151,7 @@ async function deleteSelectedBooks() {
     await api(`/api/books/${id}`, { method: "DELETE" });
   }
   state.selectedBookIds.clear();
-  await loadBooks();
+  await Promise.all([loadBooks(), loadTags(), loadRecentBooks()]);
   renderLibrary();
 }
 
@@ -899,6 +1171,123 @@ function annotationPanel(book) {
       </div>
     </aside>
   `;
+}
+
+function readerSidePanel(book) {
+  if (state.readerPanel === "search") return `
+    <aside class="reader-panel search-panel">
+      <div class="reader-panel-head"><button class="reader-icon" data-close-reader-panel>${icon("left")}</button><h2>Buscar</h2></div>
+      <label class="reader-search">${icon("search")}<input id="readerSearchInput" placeholder="Buscar no titulo, anotacoes e capitulos" value="${escapeHtml(state.readerSearch)}"></label>
+      <div class="reader-panel-list">${readerSearchResults(book)}</div>
+    </aside>
+  `;
+  if (state.readerPanel === "contents") return `
+    <aside class="reader-panel">
+      <div class="reader-tabs"><button class="active">Conteudo</button><button>Marcadores</button></div>
+      <div class="reader-panel-list">${readerContents(book)}</div>
+    </aside>
+  `;
+  if (state.readerPanel === "notes") return `
+    <aside class="reader-panel notes-panel">
+      <div class="reader-panel-head"><h2>Destaques</h2><button class="reader-icon" data-close-reader-panel>${icon("close")}</button></div>
+      <div class="reader-note-filters"><button>Meus destaques</button><button>Tags</button></div>
+      ${annotationPanel(book)}
+    </aside>
+  `;
+  if (state.readerPanel === "appearance") return `
+    <aside class="reader-panel appearance-panel">
+      <select id="readerThemeSelect">
+        <option value="paper" ${state.readerSettings.theme === "paper" ? "selected" : ""}>Padrao</option>
+        <option value="sepia" ${state.readerSettings.theme === "sepia" ? "selected" : ""}>Sepia</option>
+        <option value="dark" ${state.readerSettings.theme === "dark" ? "selected" : ""}>Escuro</option>
+      </select>
+      <div class="theme-swatches">
+        ${["paper", "sepia", "dark", "contrast", "gray"].map((theme) => `<button class="${state.readerSettings.theme === theme ? "active" : ""} swatch-${theme}" data-reader-theme="${theme}">Aa</button>`).join("")}
+      </div>
+      ${readerSettingControl("Tamanho", "fontSize", 14, 28, state.readerSettings.fontSize)}
+      ${readerSettingControl("Largura", "contentWidth", 760, 1280, state.readerSettings.contentWidth)}
+      ${readerSettingControl("Altura da linha", "lineHeight", 1.2, 2.2, state.readerSettings.lineHeight, 0.1)}
+      ${readerSettingControl("Zoom PDF", "pdfZoom", 70, 160, state.readerSettings.pdfZoom)}
+      <label class="reader-toggle"><span>Padrao da editora</span><input id="publisherDefaults" type="checkbox" ${state.readerSettings.publisherDefaults ? "checked" : ""}></label>
+      <label class="reader-toggle"><span>Rolagem vertical</span><input id="verticalScroll" type="checkbox" ${state.readerSettings.verticalScroll ? "checked" : ""}></label>
+      <label class="reader-toggle"><span>Duas colunas</span><input id="readerColumns" type="checkbox" ${state.readerSettings.columns ? "checked" : ""}></label>
+    </aside>
+  `;
+  return "";
+}
+
+function readerSettingControl(label, key, min, max, value, step = 1) {
+  return `
+    <label class="reader-control">
+      <span>${label}</span>
+      <input type="range" min="${min}" max="${max}" step="${step}" value="${value}" data-reader-setting="${key}">
+    </label>
+  `;
+}
+
+function readerContents(book) {
+  const spine = book.epub?.spine || [];
+  if (!spine.length) return `<div class="empty compact">Sem sumario extraido.</div>`;
+  return spine.map((chapter, index) => {
+    const label = pathLabel(chapter, index);
+    return `<button class="contents-row ${index === state.chapter ? "active" : ""}" data-chapter="${index}">${escapeHtml(label)}</button>`;
+  }).join("");
+}
+
+function pathLabel(pathValue, index) {
+  const file = String(pathValue || "").split(/[\\/]/).pop() || `Capitulo ${index + 1}`;
+  return file.replace(/\.[a-z0-9]+$/i, "").replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function readerSearchResults(book) {
+  const q = state.readerSearch.trim().toLowerCase();
+  if (!q) return `<div class="empty compact">Digite para buscar.</div>`;
+  const rows = [];
+  if ((book.title || "").toLowerCase().includes(q)) rows.push(`<button class="contents-row" data-chapter="${state.chapter}">${escapeHtml(book.title)}</button>`);
+  for (const item of state.annotations) {
+    const text = `${item.quote || ""} ${item.note || ""}`.toLowerCase();
+    if (text.includes(q)) rows.push(`<button class="contents-row" data-chapter="${Number(item.chapter || 0)}">${escapeHtml(item.quote || item.note || "Anotacao")}</button>`);
+  }
+  return rows.length ? rows.join("") : `<div class="empty compact">Nada encontrado.</div>`;
+}
+
+function bindReaderPanels(book) {
+  app.querySelectorAll("[data-close-reader-panel]").forEach((button) => button.onclick = () => {
+    state.readerPanel = "";
+    renderReader();
+  });
+  $("#readerSearchInput")?.addEventListener("input", (event) => {
+    state.readerSearch = event.target.value;
+    $(".reader-panel-list").innerHTML = readerSearchResults(book);
+    bindReaderPanelChapterButtons(book);
+  });
+  bindReaderPanelChapterButtons(book);
+  app.querySelectorAll("[data-reader-theme]").forEach((button) => button.onclick = () => {
+    state.readerSettings.theme = button.dataset.readerTheme;
+    saveReaderSettings();
+    renderReader();
+  });
+  $("#readerThemeSelect")?.addEventListener("change", (event) => {
+    state.readerSettings.theme = event.target.value;
+    saveReaderSettings();
+    renderReader();
+  });
+  app.querySelectorAll("[data-reader-setting]").forEach((input) => input.oninput = () => {
+    state.readerSettings[input.dataset.readerSetting] = Number(input.value);
+    saveReaderSettings();
+    renderReader();
+  });
+  $("#publisherDefaults")?.addEventListener("change", (event) => { state.readerSettings.publisherDefaults = event.target.checked; saveReaderSettings(); });
+  $("#verticalScroll")?.addEventListener("change", (event) => { state.readerSettings.verticalScroll = event.target.checked; saveReaderSettings(); renderReader(); });
+  $("#readerColumns")?.addEventListener("change", (event) => { state.readerSettings.columns = event.target.checked; saveReaderSettings(); renderReader(); });
+}
+
+function bindReaderPanelChapterButtons(book) {
+  app.querySelectorAll(".contents-row[data-chapter]").forEach((button) => button.onclick = async () => {
+    state.chapter = Number(button.dataset.chapter);
+    await saveReaderProgress(book);
+    renderReader();
+  });
 }
 
 function annotationItem(item) {
@@ -927,10 +1316,12 @@ function bindAnnotations(book) {
     const doc = $(".reader-frame")?.contentDocument;
     doc?.addEventListener("selectionchange", () => {
       const selected = selectedReaderText();
-      if (selected) quote.value = selected;
+      if (selected && quote) quote.value = selected;
     });
   });
-  $("#annotationForm").onsubmit = async (event) => {
+  const form = $("#annotationForm");
+  if (!form) return;
+  form.onsubmit = async (event) => {
     event.preventDefault();
     const msg = $("#annotationMessage");
     const data = Object.fromEntries(new FormData(event.currentTarget));
@@ -955,37 +1346,79 @@ function epubReader(book) {
   const spine = book.epub?.spine || [];
   const src = spine[state.chapter] ? `/epub/${book.id}/${encodeURIComponent(spine[state.chapter]).replaceAll("%2F", "/")}` : "";
   return `
-    <div class="epub-pane">
-      <aside class="chapters">${spine.map((chapter, index) => `<button class="${index === state.chapter ? "active" : ""}" data-chapter="${index}">Capitulo ${index + 1}</button>`).join("")}</aside>
+    <div class="epub-pane ${state.readerSettings.verticalScroll ? "is-scroll" : ""} ${state.readerSettings.columns ? "is-columns" : ""}">
       ${src ? `<iframe class="reader-frame" src="${src}"></iframe>` : `<div class="empty">Este EPUB ainda esta sendo preparado.</div>`}
     </div>
   `;
 }
 
+async function saveReaderProgress(book) {
+  const max = (book.epub?.spine?.length || 1) - 1;
+  const percent = max > 0 ? Math.round((state.chapter / max) * 100) : 100;
+  book.readingProgress = { position: state.chapter, label: `Capitulo ${state.chapter + 1}`, percent };
+  await api(`/api/books/${book.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ readingProgress: book.readingProgress })
+  });
+}
+
 function bindEpubReader(book) {
   const max = (book.epub?.spine?.length || 1) - 1;
-  const save = async () => {
-    const percent = max > 0 ? Math.round((state.chapter / max) * 100) : 100;
-    await api(`/api/books/${book.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ readingProgress: { position: state.chapter, label: `Capitulo ${state.chapter + 1}`, percent } })
-    });
-  };
+  $(".reader-frame")?.addEventListener("load", applyReaderFrameStyles);
   app.querySelectorAll("[data-chapter]").forEach((button) => button.onclick = async () => {
     state.chapter = Number(button.dataset.chapter);
-    await save();
+    await saveReaderProgress(book);
     renderReader();
   });
   $("#prevChapter").onclick = async () => {
     state.chapter = Math.max(0, state.chapter - 1);
-    await save();
+    await saveReaderProgress(book);
     renderReader();
   };
   $("#nextChapter").onclick = async () => {
     state.chapter = Math.min(max, state.chapter + 1);
-    await save();
+    await saveReaderProgress(book);
     renderReader();
   };
+  $("#readerPrevBottom")?.addEventListener("click", () => $("#prevChapter")?.click());
+  $("#readerNextBottom")?.addEventListener("click", () => $("#nextChapter")?.click());
+  $("#readerPlay")?.addEventListener("click", () => $("#nextChapter")?.click());
+  $("#readerProgress")?.addEventListener("input", async (event) => {
+    state.chapter = Number(event.target.value);
+    await saveReaderProgress(book);
+    renderReader();
+  });
+}
+
+function applyReaderFrameStyles() {
+  const frame = $(".reader-frame");
+  const doc = frame?.contentDocument;
+  if (!doc) return;
+  const style = doc.createElement("style");
+  style.textContent = `
+    html, body {
+      background: transparent !important;
+      color: inherit !important;
+      font-size: ${state.readerSettings.fontSize}px !important;
+      line-height: ${state.readerSettings.lineHeight} !important;
+      width: auto !important;
+      min-width: 0 !important;
+      max-width: ${state.readerSettings.contentWidth}px !important;
+      margin: 0 auto !important;
+      padding: 42px 64px 96px !important;
+      box-sizing: border-box !important;
+      overflow-wrap: normal !important;
+      word-break: normal !important;
+      hyphens: auto !important;
+    }
+    body { font-family: Georgia, "Times New Roman", serif !important; }
+    p, div, li { max-width: none !important; }
+    p { margin: 0 0 1em !important; text-align: left !important; }
+    h1, h2, h3 { line-height: 1.18 !important; }
+    img { max-width: 100% !important; height: auto !important; }
+    ${state.readerSettings.columns ? `body { column-count: 2; column-gap: 54px; max-width: ${Math.max(980, state.readerSettings.contentWidth)}px !important; }` : ""}
+  `;
+  doc.head.appendChild(style);
 }
 
 boot().catch((error) => {

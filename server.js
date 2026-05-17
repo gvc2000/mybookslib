@@ -15,10 +15,13 @@ const LEGACY_UPLOAD_DIR = path.join(STORAGE_DIR, "uploads");
 const UPLOAD_DIR = LIBRARY_DIR;
 const COVER_DIR = path.join(STORAGE_DIR, "covers");
 const EPUB_DIR = path.join(STORAGE_DIR, "epubs");
+const SYNOPSIS_CACHE_DIR = path.join(STORAGE_DIR, "synopsis-cache");
 const PUBLIC_DIR = path.join(ROOT, "public");
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const DB_BACKUP_PATH = path.join(DATA_DIR, "db.json.bak");
 const PORT = Number(process.env.PORT || 3000);
 const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_BYTES || 100 * 1024 * 1024);
+const HARDCOVER_TOKEN = process.env.HARDCOVER_TOKEN || "";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -39,10 +42,9 @@ const MIME = {
 };
 
 async function ensureDirs() {
-  await Promise.all([DATA_DIR, UPLOAD_DIR, COVER_DIR, EPUB_DIR, PUBLIC_DIR].map((dir) => fsp.mkdir(dir, { recursive: true })));
+  await Promise.all([DATA_DIR, UPLOAD_DIR, COVER_DIR, EPUB_DIR, SYNOPSIS_CACHE_DIR, PUBLIC_DIR].map((dir) => fsp.mkdir(dir, { recursive: true })));
   if (!fs.existsSync(DB_PATH)) {
-    const admin = createUser("Administrador", "admin@local", "admin123", "admin");
-    await saveDb({ users: [admin], books: [], annotations: [], subjects: [], shelves: [], sessions: [] });
+    await saveDb(initialDb());
   }
   const db = readDb();
   let migrated = false;
@@ -95,12 +97,91 @@ function repairMojibake(value) {
   return repaired.includes("\uFFFD") ? text : repaired;
 }
 
+function initialDb() {
+  return { users: [createUser("Administrador", "admin@local", "admin123", "admin")], books: [], annotations: [], subjects: [], shelves: [], sessions: [] };
+}
+
+function parseDbText(text, source) {
+  if (!String(text || "").trim()) throw new Error(`${source} vazio`);
+  return JSON.parse(text);
+}
+
 function readDb() {
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+  try {
+    return parseDbText(fs.readFileSync(DB_PATH, "utf8"), "db.json");
+  } catch (error) {
+    if (fs.existsSync(DB_BACKUP_PATH)) {
+      const backup = parseDbText(fs.readFileSync(DB_BACKUP_PATH, "utf8"), "db.json.bak");
+      fs.writeFileSync(DB_PATH, JSON.stringify(backup, null, 2));
+      return backup;
+    }
+    const db = recoverDbFromStorage();
+    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+    return db;
+  }
+}
+
+function recoverDbFromStorage() {
+  const db = initialDb();
+  const userId = db.users[0].id;
+  const files = fs.existsSync(UPLOAD_DIR)
+    ? fs.readdirSync(UPLOAD_DIR).filter((name) => /\.(epub|pdf)$/i.test(name))
+    : [];
+  for (const name of files) {
+    const filePath = path.join(UPLOAD_DIR, name);
+    const stat = fs.statSync(filePath);
+    const bookId = path.parse(name).name;
+    const ext = path.extname(name).toLowerCase();
+    const cover = findExistingCover(bookId);
+    const now = stat.mtime.toISOString();
+    db.books.push({
+      id: bookId,
+      userId,
+      title: path.parse(name).name,
+      author: "Autor desconhecido",
+      publisher: "",
+      isbn: "",
+      language: "",
+      publishedDate: "",
+      description: "",
+      pageCount: "",
+      metadataSource: "",
+      format: ext.replace(".", ""),
+      originalName: name,
+      relativeFolder: "",
+      filePath,
+      fileSize: stat.size,
+      fileHash: "",
+      coverPath: cover,
+      coverUrl: "",
+      coverSvg: "",
+      subjects: [],
+      tags: [],
+      shelf: "MyBookLib",
+      readingProgress: { position: 0, label: "", percent: 0 },
+      status: "uploaded",
+      createdAt: now,
+      updatedAt: now
+    });
+  }
+  return db;
+}
+
+function findExistingCover(bookId) {
+  if (!fs.existsSync(COVER_DIR)) return "";
+  const found = fs.readdirSync(COVER_DIR).find((name) => path.parse(name).name === bookId);
+  return found ? path.join(COVER_DIR, found) : "";
 }
 
 async function saveDb(db) {
-  await fsp.writeFile(DB_PATH, JSON.stringify(db, null, 2));
+  const text = JSON.stringify(db, null, 2);
+  JSON.parse(text);
+  const tempPath = `${DB_PATH}.${process.pid}.${Date.now()}.tmp`;
+  if (fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
+    await fsp.copyFile(DB_PATH, DB_BACKUP_PATH).catch(() => {});
+  }
+  await fsp.writeFile(tempPath, text);
+  await fsp.rename(tempPath, DB_PATH);
 }
 
 function id(prefix) {
@@ -288,8 +369,38 @@ async function fetchJson(url) {
   return JSON.parse(buffer.toString("utf8"));
 }
 
+async function postJson(url, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const body = JSON.stringify(payload);
+    const req = https.request(target, {
+      method: "POST",
+      headers: {
+        "User-Agent": "MyBookLib/0.1",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        ...headers
+      },
+      timeout: 10000
+    }, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+    });
+    req.on("timeout", () => req.destroy(new Error("Tempo esgotado ao buscar metadados")));
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 function cleanOnlineText(value) {
-  return String(value || "")
+  return repairMojibake(String(value || ""))
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n\n")
     .replace(/<[^>]+>/g, "")
@@ -317,12 +428,25 @@ function shouldFillBookField(book, key) {
   if (value === undefined || value === null || String(value).trim() === "") return true;
   if (key === "author") return /^autor desconhecido$/i.test(String(value)) || /^unknown$/i.test(String(value));
   if (key === "title") return looksLikeFilenameTitle(book, value);
+  if (key === "isbn") return Boolean(value) && !validIsbn(value);
   return false;
 }
 
+function normalizeIsbn(value) {
+  return String(value || "").replace(/[^\dXx]/g, "").toUpperCase();
+}
+
+function validIsbn(value) {
+  const isbn = normalizeIsbn(value);
+  return /^(?:\d{9}[\dX]|\d{13})$/.test(isbn);
+}
+
 function isbnFromIdentifiers(identifiers = []) {
-  const found = identifiers.find((item) => /isbn/i.test(item.type || "") && item.identifier);
-  return found ? String(found.identifier).replace(/[^\dXx]/g, "") : "";
+  const values = identifiers
+    .filter((item) => /isbn/i.test(item.type || "") && item.identifier)
+    .map((item) => normalizeIsbn(item.identifier))
+    .filter(validIsbn);
+  return values.find((item) => item.length === 13) || values[0] || "";
 }
 
 function normalizeBookMetadata(raw) {
@@ -331,14 +455,66 @@ function normalizeBookMetadata(raw) {
     title: firstString(raw.title),
     author: firstString(raw.author),
     publisher: firstString(raw.publisher),
-    isbn: firstString(raw.isbn).replace(/[^\dXx]/g, ""),
+    isbn: validIsbn(firstString(raw.isbn)) ? normalizeIsbn(firstString(raw.isbn)) : "",
     language: firstString(raw.language),
     publishedDate: firstString(raw.publishedDate),
     description: cleanOnlineText(raw.description),
     pageCount: Number(raw.pageCount || 0) || "",
+    tags: Array.isArray(raw.tags) ? raw.tags.map(cleanOnlineText).filter(Boolean) : [],
     coverUrl: firstString(raw.coverUrl).replace(/^http:\/\//i, "https://"),
     source: firstString(raw.source)
   };
+}
+
+function metadataScore(raw) {
+  const metadata = normalizeBookMetadata(raw);
+  if (!metadata) return 0;
+  return (metadata.description ? 100 : 0) +
+    (metadata.tags.length ? Math.min(metadata.tags.length, 12) * 4 : 0) +
+    (metadata.coverUrl ? 12 : 0) +
+    (metadata.isbn ? 8 : 0) +
+    (metadata.publisher ? 4 : 0) +
+    (metadata.publishedDate ? 4 : 0) +
+    (metadata.pageCount ? 3 : 0);
+}
+
+function synopsisResultToMetadata(result) {
+  if (!result?.description) return null;
+  return {
+    title: result.title,
+    author: result.authors,
+    language: result.language,
+    description: result.description,
+    source: result.source
+  };
+}
+
+function synopsisCachePath(book) {
+  const key = JSON.stringify({ isbn: book.isbn || "", title: book.title || book.originalName || "", author: book.author || "" });
+  const hash = crypto.createHash("sha256").update(key).digest("hex");
+  return path.join(SYNOPSIS_CACHE_DIR, `${hash}.json`);
+}
+
+async function readSynopsisCache(book) {
+  const cachePath = synopsisCachePath(book);
+  if (!fs.existsSync(cachePath)) return null;
+  const data = JSON.parse(await fsp.readFile(cachePath, "utf8"));
+  return data?.description ? data : null;
+}
+
+async function writeSynopsisCache(book, result) {
+  if (!result?.description) return;
+  await fsp.mkdir(SYNOPSIS_CACHE_DIR, { recursive: true });
+  await fsp.writeFile(synopsisCachePath(book), JSON.stringify(result, null, 2));
+}
+
+function mergeTags(current, incoming) {
+  const merged = new Map();
+  for (const tag of [...(current || []), ...(incoming || [])]) {
+    const clean = cleanOnlineText(tag);
+    if (clean) merged.set(clean.toLocaleLowerCase("pt-BR"), clean);
+  }
+  return [...merged.values()].slice(0, 24);
 }
 
 function applyOnlineMetadata(book, raw) {
@@ -351,78 +527,200 @@ function applyOnlineMetadata(book, raw) {
       changed = true;
     }
   }
+  if (metadata.tags.length) {
+    const nextTags = mergeTags(book.tags, metadata.tags);
+    if (nextTags.length !== (book.tags || []).length) {
+      book.tags = nextTags;
+      changed = true;
+    }
+  }
   if (changed && metadata.source) book.metadataSource = metadata.source;
   return changed;
 }
 
 async function findGoogleBooksMetadata(book, candidates = coverSearchCandidates(book)) {
   const searches = [];
-  if (book.isbn) searches.push(`isbn:${book.isbn}`);
+  const author = repairMojibake(book.author || "");
+  if (validIsbn(book.isbn)) searches.push(`isbn:${normalizeIsbn(book.isbn)}`);
   for (const title of candidates) {
-    searches.push(hasKnownAuthor(book) ? `intitle:"${title}" inauthor:"${book.author}"` : `intitle:"${title}"`);
-    searches.push(hasKnownAuthor(book) ? `"${title}" "${book.author}"` : `"${title}"`);
+    searches.push(hasKnownAuthor(book) ? `intitle:${title} inauthor:${author}` : `intitle:${title}`);
+    searches.push(hasKnownAuthor(book) ? `${title} ${author}` : title);
   }
   for (const q of [...new Set(searches)].slice(0, 8)) {
-    const params = new URLSearchParams({ q, maxResults: "10", projection: "full" });
-    const data = await fetchJson(`https://www.googleapis.com/books/v1/volumes?${params}`);
-    const item = (data.items || []).find((entry) => {
-      const info = entry.volumeInfo || {};
-      return info.title && (info.description || info.publisher || info.industryIdentifiers?.length);
-    });
-    const info = item?.volumeInfo;
-    if (!info) continue;
-    const image = info.imageLinks?.extraLarge || info.imageLinks?.large || info.imageLinks?.medium || info.imageLinks?.thumbnail || info.imageLinks?.smallThumbnail;
+    const queryVariants = [
+      new URLSearchParams({ q, maxResults: "10", projection: "full", langRestrict: "pt" }),
+      new URLSearchParams({ q, maxResults: "10", projection: "full" })
+    ];
+    for (const params of queryVariants) {
+      const data = await fetchJson(`https://www.googleapis.com/books/v1/volumes?${params}`);
+      const matches = (data.items || []).filter((entry) => {
+        const info = entry.volumeInfo || {};
+        return info.title && (info.description || info.publisher || info.industryIdentifiers?.length);
+      }).map((entry) => {
+        const info = entry.volumeInfo || {};
+        const image = info.imageLinks?.extraLarge || info.imageLinks?.large || info.imageLinks?.medium || info.imageLinks?.thumbnail || info.imageLinks?.smallThumbnail;
+        return {
+          title: info.title,
+          author: info.authors,
+          publisher: info.publisher,
+          isbn: isbnFromIdentifiers(info.industryIdentifiers),
+          language: info.language,
+          publishedDate: info.publishedDate,
+          description: info.description,
+          pageCount: info.pageCount,
+          tags: info.categories,
+          coverUrl: image,
+          source: "Google Books"
+        };
+      }).sort((a, b) => metadataScore(b) - metadataScore(a));
+      const item = matches[0];
+      if (item) return item;
+    }
+  }
+  return null;
+}
+
+async function findGoogleBooksSynopsis(book, candidates = coverSearchCandidates(book)) {
+  const metadata = await findGoogleBooksMetadata(book, candidates);
+  if (metadata?.description) {
     return {
-      title: info.title,
-      author: info.authors,
-      publisher: info.publisher,
-      isbn: isbnFromIdentifiers(info.industryIdentifiers),
-      language: info.language,
-      publishedDate: info.publishedDate,
-      description: info.description,
-      pageCount: info.pageCount,
-      coverUrl: image,
-      source: "Google Books"
+      source: "Google Books",
+      title: metadata.title,
+      authors: metadata.author,
+      description: metadata.description,
+      language: metadata.language
     };
   }
   return null;
 }
 
+async function openLibraryWorkDescription(key) {
+  if (!key) return "";
+  const work = await fetchJson(`https://openlibrary.org${key}.json`).catch(() => null);
+  return typeof work?.description === "string" ? work.description : work?.description?.value || "";
+}
+
 async function findOpenLibraryMetadata(book, candidates = coverSearchCandidates(book)) {
   const searches = [];
-  if (book.isbn) searches.push(new URLSearchParams({ isbn: book.isbn, limit: "5" }));
+  if (validIsbn(book.isbn)) searches.push(new URLSearchParams({ isbn: normalizeIsbn(book.isbn), limit: "10" }));
   for (const title of candidates) {
-    const params = new URLSearchParams({ title, limit: "5" });
-    if (hasKnownAuthor(book)) params.set("author", book.author);
+    const params = new URLSearchParams({ title, limit: "10" });
+    if (hasKnownAuthor(book)) params.set("author", repairMojibake(book.author));
     searches.push(params);
   }
   for (const params of searches.slice(0, 8)) {
     const data = await fetchJson(`https://openlibrary.org/search.json?${params}`);
-    const doc = (data.docs || []).find((item) => item.title);
-    if (!doc) continue;
-    let description = "";
-    if (doc.key) {
-      const work = await fetchJson(`https://openlibrary.org${doc.key}.json`).catch(() => null);
-      description = typeof work?.description === "string" ? work.description : work?.description?.value || "";
+    const candidates = [];
+    for (const doc of (data.docs || []).filter((item) => item.title).slice(0, 5)) {
+      const description = await openLibraryWorkDescription(doc.key);
+      candidates.push({
+        title: doc.title,
+        author: doc.author_name,
+        publisher: doc.publisher,
+        isbn: doc.isbn,
+        language: doc.language,
+        publishedDate: doc.first_publish_year ? String(doc.first_publish_year) : "",
+        description,
+        pageCount: doc.number_of_pages_median,
+        tags: doc.subject,
+        coverUrl: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : "",
+        source: "Open Library"
+      });
     }
-    return {
-      title: doc.title,
-      author: doc.author_name,
-      publisher: doc.publisher,
-      isbn: doc.isbn,
-      language: doc.language,
-      publishedDate: doc.first_publish_year ? String(doc.first_publish_year) : "",
-      description,
-      pageCount: doc.number_of_pages_median,
-      coverUrl: doc.cover_i ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-L.jpg` : "",
-      source: "Open Library"
-    };
+    candidates.sort((a, b) => metadataScore(b) - metadataScore(a));
+    if (candidates[0]) return candidates[0];
+  }
+  return null;
+}
+
+async function findOpenLibrarySynopsis(book, candidates = coverSearchCandidates(book)) {
+  let workKey = "";
+  let foundTitle = "";
+  if (validIsbn(book.isbn)) {
+    const edition = await fetchJson(`https://openlibrary.org/isbn/${encodeURIComponent(normalizeIsbn(book.isbn))}.json`).catch(() => null);
+    if (edition) {
+      foundTitle = edition.title || "";
+      const direct = cleanOnlineText(typeof edition.description === "string" ? edition.description : edition.description?.value || "");
+      if (direct) return { source: "Open Library", title: foundTitle, description: direct };
+      workKey = edition.works?.[0]?.key || "";
+    }
+  }
+  if (!workKey) {
+    for (const title of candidates) {
+      const params = new URLSearchParams({ title, limit: "1" });
+      if (hasKnownAuthor(book)) params.set("author", repairMojibake(book.author));
+      const data = await fetchJson(`https://openlibrary.org/search.json?${params}`).catch(() => null);
+      const doc = (data?.docs || [])[0];
+      if (doc?.key) {
+        workKey = doc.key;
+        foundTitle = doc.title || "";
+        break;
+      }
+    }
+  }
+  const description = await openLibraryWorkDescription(workKey);
+  return description ? { source: "Open Library", title: foundTitle, description } : null;
+}
+
+async function findWikipediaSynopsis(book, candidates = coverSearchCandidates(book)) {
+  for (const title of candidates) {
+    const term = hasKnownAuthor(book) ? `${title} ${book.author}` : title;
+    for (const lang of ["pt", "en"]) {
+      const searchParams = new URLSearchParams({ action: "opensearch", search: term, limit: "1", namespace: "0", format: "json" });
+      const search = await fetchJson(`https://${lang}.wikipedia.org/w/api.php?${searchParams}`).catch(() => null);
+      const article = Array.isArray(search) && Array.isArray(search[1]) ? search[1][0] : "";
+      if (!article) continue;
+      const summary = await fetchJson(`https://${lang}.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(article)}`).catch(() => null);
+      const extract = cleanOnlineText(summary?.extract || "");
+      if (extract) return { source: `Wikipedia (${lang})`, title: summary?.title || article, description: extract, language: lang };
+    }
+  }
+  return null;
+}
+
+async function findHardcoverSynopsis(book, candidates = coverSearchCandidates(book)) {
+  if (!HARDCOVER_TOKEN) return null;
+  let query = "";
+  let variables = {};
+  if (book.isbn) {
+    query = "query ($isbn: String!) { editions(where: {isbn_13: {_eq: $isbn}}, limit: 1) { book { title description } } }";
+    variables = { isbn: book.isbn };
+  } else if (candidates[0]) {
+    query = "query ($title: String!) { books(where: {title: {_ilike: $title}}, limit: 1) { title description } }";
+    variables = { title: `%${candidates[0]}%` };
+  } else {
+    return null;
+  }
+  const data = await postJson("https://api.hardcover.app/v1/graphql", { query, variables }, { Authorization: `Bearer ${HARDCOVER_TOKEN}` }).catch(() => null);
+  const bookResult = data?.data?.editions?.[0]?.book || data?.data?.books?.[0];
+  const description = cleanOnlineText(bookResult?.description || "");
+  return description ? { source: "Hardcover", title: bookResult?.title, description } : null;
+}
+
+async function findSynopsisFallback(book, candidates = coverSearchCandidates(book)) {
+  const cached = await readSynopsisCache(book).catch(() => null);
+  if (cached) return cached;
+  const sources = [
+    () => findGoogleBooksSynopsis(book, candidates),
+    () => findOpenLibrarySynopsis(book, candidates),
+    () => findWikipediaSynopsis(book, candidates),
+    () => findHardcoverSynopsis(book, candidates)
+  ];
+  for (const source of sources) {
+    const result = await source().catch(() => null);
+    if (result?.description) {
+      await writeSynopsisCache(book, result).catch(() => {});
+      return result;
+    }
   }
   return null;
 }
 
 async function enrichOnlineMetadata(book) {
+  if (book.isbn && !validIsbn(book.isbn)) book.isbn = "";
+  book.metadataError = "";
   const candidates = coverSearchCandidates(book);
+  let source = "";
   const lookups = [
     () => findGoogleBooksMetadata(book, candidates),
     () => findOpenLibraryMetadata(book, candidates)
@@ -431,15 +729,23 @@ async function enrichOnlineMetadata(book) {
     const metadata = await lookup().catch(() => null);
     if (!metadata) continue;
     const changed = applyOnlineMetadata(book, metadata);
+    if (changed && metadata.source) source = source || metadata.source;
     if (!book.coverPath && !book.coverUrl && metadata.coverUrl) {
       await downloadCover(book, metadata.coverUrl).catch(() => {
         book.coverUrl = metadata.coverUrl;
       });
       if (book.coverPath || book.coverUrl) book.coverSource = metadata.source;
     }
-    if (changed || book.coverPath || book.coverUrl) return metadata.source || "online";
+    if (book.description && (book.tags || []).length) return source || metadata.source || "online";
   }
-  return "";
+  if (!book.description) {
+    const synopsis = await findSynopsisFallback(book, candidates);
+    if (synopsis?.description && applyOnlineMetadata(book, synopsisResultToMetadata(synopsis))) {
+      return source || synopsis.source || "online";
+    }
+  }
+  if (!book.description) book.metadataError = "Sinopse nao encontrada nas fontes gratuitas consultadas";
+  return source;
 }
 
 function coverExt(contentType, url) {
@@ -493,6 +799,12 @@ function textTag(xml, tag) {
   return match ? decodeXml(match[1].replace(/<[^>]+>/g, "").trim()) : "";
 }
 
+function textTags(xml, tag) {
+  return [...String(xml || "").matchAll(new RegExp(`<[^:>]*:?${tag}[^>]*>([\\s\\S]*?)<\\/[^:>]*:?${tag}>`, "gi"))]
+    .map((match) => decodeXml(match[1].replace(/<[^>]+>/g, "").trim()))
+    .filter(Boolean);
+}
+
 async function analyzeEpub(book, filePath) {
   const outDir = await extractEpub(filePath, book.id);
   const containerPath = path.join(outDir, "META-INF", "container.xml");
@@ -506,8 +818,10 @@ async function analyzeEpub(book, filePath) {
   book.author = book.author || textTag(opf, "creator") || "Autor desconhecido";
   book.publisher = textTag(opf, "publisher");
   book.language = textTag(opf, "language");
-  const identifier = textTag(opf, "identifier");
-  book.isbn = /(?:97[89])?\d[\d -]{8,}\d/.test(identifier) ? identifier.replace(/[^\dXx]/g, "") : "";
+  book.description = book.description || cleanOnlineText(textTag(opf, "description"));
+  book.tags = mergeTags(book.tags, textTags(opf, "subject"));
+  const identifiers = textTags(opf, "identifier").map((identifier) => normalizeIsbn(identifier)).filter(validIsbn);
+  book.isbn = identifiers.find((item) => item.length === 13) || identifiers[0] || "";
   const manifest = {};
   for (const item of opf.matchAll(/<item\b[^>]*>/gi)) {
     const tag = item[0];
@@ -560,8 +874,8 @@ async function findOnlineCover(book) {
 
 function coverSearchCandidates(book) {
   const raw = [
-    book.title,
-    path.parse(book.originalName || "").name
+    repairMojibake(book.title),
+    repairMojibake(path.parse(book.originalName || "").name)
   ].filter(Boolean);
   const cleaned = raw.flatMap((value) => {
     const title = String(value).replace(/\s+\[[^\]]+\]$/, "").trim();
@@ -739,7 +1053,7 @@ async function processBook(book, filePath) {
   book.updatedAt = new Date().toISOString();
   const db = readDb();
   const index = db.books.findIndex((item) => item.id === book.id);
-  if (index > -1) db.books[index] = book;
+  if (index > -1) db.books[index] = { ...db.books[index], ...book };
   await saveDb(db);
 }
 
@@ -760,6 +1074,65 @@ function wantsAllBooks(req, user) {
 
 function booksForUser(db, user, req) {
   return db.books.filter((book) => wantsAllBooks(req, user) || book.userId === user.id);
+}
+
+function subjectKeyForFilter(value) {
+  return String(value || "").trim().toLocaleLowerCase("pt-BR");
+}
+
+function bookMatchesListValue(bookValues, filterValue) {
+  const needle = subjectKeyForFilter(filterValue);
+  if (!needle) return true;
+  return (bookValues || []).some((item) => subjectKeyForFilter(item) === needle);
+}
+
+function bookMatchesShelfFilter(book, tab) {
+  const status = book.readingStatus || "";
+  const percent = Number(book.readingProgress?.percent || 0);
+  if (!tab || tab === "all") return true;
+  if (tab === "favorite") return status === "favorite";
+  if (tab === "planned") return status === "planned";
+  if (tab === "completed") return status === "completed" || percent >= 100;
+  return true;
+}
+
+function filteredBooksForRequest(db, user, req) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const q = String(url.searchParams.get("q") || "").trim().toLowerCase();
+  const subject = url.searchParams.get("subject") || "";
+  const tag = url.searchParams.get("tag") || "";
+  const format = url.searchParams.get("format") || "";
+  const shelfTab = url.searchParams.get("shelfTab") || "all";
+  return booksForUser(db, user, req).filter((book) => {
+    const haystack = [book.title, book.author, book.publisher, book.shelf, book.originalName, ...(book.subjects || []), ...(book.tags || [])].join(" ").toLowerCase();
+    return (!q || haystack.includes(q)) &&
+      bookMatchesListValue(book.subjects, subject) &&
+      bookMatchesListValue(book.tags, tag) &&
+      (!format || book.format === format) &&
+      bookMatchesShelfFilter(book, shelfTab);
+  });
+}
+
+function paginate(items, req) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pageSize = Math.max(12, Math.min(120, Number(url.searchParams.get("pageSize") || 60)));
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+  const total = items.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const start = (safePage - 1) * pageSize;
+  return { page: safePage, pageSize, total, totalPages, items: items.slice(start, start + pageSize) };
+}
+
+function catalogTagsForUser(db, user, req) {
+  const tags = new Map();
+  booksForUser(db, user, req).forEach((book) => {
+    (book.tags || []).forEach((tag) => {
+      const clean = normalizeSubjectName(tag);
+      if (clean) tags.set(clean.toLocaleLowerCase("pt-BR"), clean);
+    });
+  });
+  return [...tags.values()].sort((a, b) => a.localeCompare(b, "pt-BR"));
 }
 
 function publicBook(db, book) {
@@ -979,11 +1352,53 @@ function routeApi(req, res, pathname, user) {
       return json(res, 200, { subjects: db.subjects });
     }
     if (pathname === "/api/books" && req.method === "GET") {
-      return json(res, 200, { books: booksForUser(db, user, req).map((book) => publicBook(db, book)) });
+      const filtered = filteredBooksForRequest(db, user, req)
+        .sort((a, b) => new Date(b.lastOpenedAt || b.createdAt || 0) - new Date(a.lastOpenedAt || a.createdAt || 0));
+      const page = paginate(filtered, req);
+      return json(res, 200, {
+        books: page.items.map((book) => publicBook(db, book)),
+        page: page.page,
+        pageSize: page.pageSize,
+        total: page.total,
+        totalPages: page.totalPages
+      });
+    }
+    if (pathname === "/api/books/recent" && req.method === "GET") {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const limit = Math.max(3, Math.min(24, Number(url.searchParams.get("limit") || 12)));
+      const books = booksForUser(db, user, req)
+        .filter((book) => book.lastOpenedAt)
+        .sort((a, b) => new Date(b.lastOpenedAt) - new Date(a.lastOpenedAt))
+        .slice(0, limit)
+        .map((book) => publicBook(db, book));
+      return json(res, 200, { books });
+    }
+    if (pathname === "/api/tags" && req.method === "GET") {
+      return json(res, 200, { tags: catalogTagsForUser(db, user, req) });
     }
     if (pathname === "/api/books/deduplicate" && req.method === "POST") {
       const result = await deduplicateLibrary(db, user, req);
       return json(res, 200, result);
+    }
+    if (pathname === "/api/books/subjects" && req.method === "PATCH") {
+      const body = JSON.parse((await readBody(req, 1024 * 100)).toString("utf8") || "{}");
+      const subject = normalizeSubjectName(body.subject);
+      const ids = Array.isArray(body.bookIds) ? body.bookIds.map(String) : [];
+      if (!subject) return json(res, 400, { error: "Informe o assunto" });
+      if (!ids.length) return json(res, 400, { error: "Selecione pelo menos um livro" });
+      ensureSubjectsInCatalog(db, [subject]);
+      let updated = 0;
+      for (const book of db.books) {
+        if (!ids.includes(book.id) || !canAccessBook(user, book)) continue;
+        const subjects = Array.isArray(book.subjects) ? book.subjects : [];
+        if (!subjects.some((item) => item.toLowerCase() === subject.toLowerCase())) {
+          book.subjects = [...subjects, subject].sort((a, b) => a.localeCompare(b, "pt-BR"));
+          book.updatedAt = new Date().toISOString();
+          updated += 1;
+        }
+      }
+      await saveDb(db);
+      return json(res, 200, { updated, subjects: db.subjects });
     }
     if (pathname === "/api/books" && req.method === "POST") {
       const parts = parseMultipart(await readBody(req), req.headers["content-type"]);
@@ -995,7 +1410,7 @@ function routeApi(req, res, pathname, user) {
       }
       const books = results.map((result) => result.book).filter(Boolean);
       const errors = results.map((result) => result.error).filter(Boolean);
-      return json(res, books.length ? 201 : 400, { book: books[0], books, errors });
+      return json(res, books.length ? 201 : 200, { book: books[0], books, errors });
     }
     const bookOpenMatch = pathname.match(/^\/api\/books\/([^/]+)\/open$/);
     if (bookOpenMatch && req.method === "POST") {
@@ -1061,11 +1476,12 @@ function routeApi(req, res, pathname, user) {
     if (coverLookupMatch && req.method === "POST") {
       const book = db.books.find((item) => item.id === coverLookupMatch[1] && canAccessBook(user, item));
       if (!book) return notFound(res);
-      let source = await findOnlineCover(book);
+      let source = await enrichOnlineMetadata(book);
+      if (!book.coverPath && !book.coverUrl) source = await findOnlineCover(book);
       if (!source) {
         source = await extractFileCover(book);
       }
-      if (!source) return json(res, 404, { error: "Nao encontrei uma capa online nem consegui gerar capa a partir do arquivo" });
+      if (!source) return json(res, 404, { error: "Nao encontrei metadados online nem consegui gerar capa a partir do arquivo" });
       book.updatedAt = new Date().toISOString();
       await saveDb(db);
       return json(res, 200, { book: publicBook(db, book), source });
