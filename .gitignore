@@ -2,5 +2,6 @@ data/
 storage/
 server.log
 server.err.log
+server.out.log
 .gitconfig-codex
 git-meta/
